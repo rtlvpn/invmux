@@ -17,6 +17,9 @@ func main() {
 	conn2a, conn2b := net.Pipe()
 	conn3a, conn3b := net.Pipe()
 
+	fmt.Println("=== InvMux Advanced Example ===")
+	fmt.Println("This example demonstrates different distribution policies and connection statistics")
+
 	// Create advanced configuration
 	clientConfig := &invmux.Config{
 		// Basic settings
@@ -40,24 +43,26 @@ func main() {
 		KeepAliveInterval:      15 * time.Second, // Keep-alive every 15 seconds
 		ConnectionWriteTimeout: 5 * time.Second,  // 5 second write timeout
 
-		// Distribution policy
-		DistributionPolicy: invmux.HighestBandwidth, // Use highest bandwidth policy
+		// Distribution policy - we'll change this during the example
+		DistributionPolicy: invmux.RoundRobin,
 
-		// Optional features - disabled for this example
-		EnableCompression: false,
-		EnableEncryption:  false,
+		// Connection weights for weighted distribution
+		ConnectionWeights: map[string]int{
+			// We'll set these after creating connections
+		},
 	}
 
 	// Server uses default config for this example
 	serverConfig := invmux.DefaultConfig()
-	serverConfig.DistributionPolicy = invmux.HighestBandwidth // Match client policy
+	// Match client policy
+	serverConfig.DistributionPolicy = invmux.RoundRobin
 
 	// Create sessions
 	clientSession := invmux.NewSession(clientConfig)
 	serverSession := invmux.NewSession(serverConfig)
 
 	// Add physical connections to sessions
-	fmt.Println("Adding physical connections...")
+	fmt.Println("\nAdding physical connections...")
 
 	go func() {
 		clientSession.AddPhysicalConnection(conn1a)
@@ -116,11 +121,67 @@ func main() {
 		}
 	}()
 
-	// Client: Open multiple streams
+	// Let's demonstrate each distribution policy
+
+	// 1. Round Robin (default)
+	fmt.Println("\n=== Round Robin Distribution ===")
+	demoDistributionPolicy(clientSession, invmux.RoundRobin)
+
+	// Wait a bit to let everything finish
+	time.Sleep(1 * time.Second)
+
+	// 2. Lowest Latency
+	fmt.Println("\n=== Lowest Latency Distribution ===")
+	demoDistributionPolicy(clientSession, invmux.LowestLatency)
+
+	// Wait a bit to let everything finish
+	time.Sleep(1 * time.Second)
+
+	// 3. Highest Bandwidth
+	fmt.Println("\n=== Highest Bandwidth Distribution ===")
+	demoDistributionPolicy(clientSession, invmux.HighestBandwidth)
+
+	// Wait a bit to let everything finish
+	time.Sleep(1 * time.Second)
+
+	// 4. Weighted Round Robin
+	fmt.Println("\n=== Weighted Round Robin Distribution ===")
+
+	// Get connection stats to set weights
+	stats := clientSession.GetConnectionStats()
+	if len(stats) >= 3 {
+		// Set different weights for each connection
+		clientSession.SetConnectionWeight(stats[0].ID, 1) // 1x traffic
+		clientSession.SetConnectionWeight(stats[1].ID, 2) // 2x traffic
+		clientSession.SetConnectionWeight(stats[2].ID, 5) // 5x traffic
+
+		fmt.Println("Set connection weights: 1, 2, and 5")
+	}
+
+	demoDistributionPolicy(clientSession, invmux.WeightedRoundRobin)
+
+	// Display connection statistics
+	fmt.Println("\n=== Connection Statistics ===")
+	displayConnectionStats(clientSession)
+
+	// Close sessions
+	fmt.Println("\nClosing sessions...")
+	clientSession.Close()
+	serverSession.Close()
+
+	fmt.Println("Advanced example completed successfully")
+}
+
+// demoDistributionPolicy demonstrates a specific distribution policy
+func demoDistributionPolicy(session *invmux.Session, policy invmux.DistributionPolicy) {
+	// Set the distribution policy
+	session.SetDistributionPolicy(policy)
+
+	// Send some test data using multiple streams
 	for i := 0; i < 3; i++ {
 		go func(streamNum int) {
 			// Open a stream
-			clientStream, err := clientSession.OpenStream()
+			clientStream, err := session.OpenStream()
 			if err != nil {
 				fmt.Printf("Failed to open stream %d: %v\n", streamNum, err)
 				return
@@ -131,12 +192,15 @@ func main() {
 			// Set a deadline
 			clientStream.SetDeadline(time.Now().Add(10 * time.Second))
 
-			// Write data to the stream
-			message := fmt.Sprintf("Hello from stream %d! This message will be split across multiple physical connections.", streamNum)
-			_, err = clientStream.Write([]byte(message))
-			if err != nil {
-				fmt.Printf("Stream %d write error: %v\n", streamNum, err)
-				return
+			// Write data to the stream - multiple chunks to demonstrate distribution
+			for j := 0; j < 5; j++ {
+				message := fmt.Sprintf("Hello from stream %d, message %d! This will be distributed according to the policy.", streamNum, j)
+				_, err = clientStream.Write([]byte(message))
+				if err != nil {
+					fmt.Printf("Stream %d write error: %v\n", streamNum, err)
+					return
+				}
+				time.Sleep(50 * time.Millisecond)
 			}
 
 			// Read response
@@ -155,17 +219,38 @@ func main() {
 		}(i)
 	}
 
-	// Wait for all streams to complete
-	time.Sleep(3 * time.Second)
+	// Wait for streams to complete
+	time.Sleep(1 * time.Second)
+}
 
-	// Show stream stats
-	fmt.Printf("Client has %d active streams\n", clientSession.NumStreams())
-	fmt.Printf("Server has %d active streams\n", serverSession.NumStreams())
+// displayConnectionStats shows detailed statistics for all connections
+func displayConnectionStats(session *invmux.Session) {
+	// Get all connection stats
+	stats := session.GetConnectionStats()
+	fmt.Printf("Total connections: %d\n", len(stats))
 
-	// Close sessions
-	fmt.Println("Closing sessions...")
-	clientSession.Close()
-	serverSession.Close()
+	for i, stat := range stats {
+		fmt.Printf("\nConnection #%d:\n", i+1)
+		fmt.Printf("  ID: %s\n", stat.ID)
+		fmt.Printf("  Latency: %v\n", stat.Latency)
+		fmt.Printf("  Bandwidth: %d bytes/sec\n", stat.Bandwidth)
+		fmt.Printf("  Bytes Sent: %d\n", stat.BytesSent)
+		fmt.Printf("  Bytes Received: %d\n", stat.BytesReceived)
+		fmt.Printf("  Weight: %d\n", stat.Weight)
+		fmt.Printf("  Last Activity: %v\n", stat.LastActivity)
+	}
 
-	fmt.Println("Advanced example completed successfully")
+	// Show connections sorted by latency
+	fmt.Println("\nConnections sorted by latency (lowest first):")
+	latencyStats := session.SortConnectionsByLatency()
+	for i, stat := range latencyStats {
+		fmt.Printf("  %d. ID: %s, Latency: %v\n", i+1, stat.ID, stat.Latency)
+	}
+
+	// Show connections sorted by bandwidth
+	fmt.Println("\nConnections sorted by bandwidth (highest first):")
+	bandwidthStats := session.SortConnectionsByBandwidth()
+	for i, stat := range bandwidthStats {
+		fmt.Printf("  %d. ID: %s, Bandwidth: %d bytes/sec\n", i+1, stat.ID, stat.Bandwidth)
+	}
 }

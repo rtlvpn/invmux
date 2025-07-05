@@ -8,9 +8,10 @@ InvMux is a Go library that implements inverse multiplexing for network connecti
 - Automatic chunking and reassembly of data packets
 - Bidirectional communication
 - Stream-oriented API similar to net.Conn
-- Multiple distribution policies (round-robin, lowest latency, highest bandwidth)
+- Multiple distribution policies (round-robin, lowest latency, highest bandwidth, weighted)
 - Out-of-order packet handling and reassembly
 - Configurable buffer sizes and window sizes
+- Connection statistics and monitoring
 - Easily add or remove physical connections at runtime
 
 ## Usage
@@ -83,12 +84,6 @@ config := &invmux.Config{
     // Distribution policy
     DistributionPolicy:     invmux.RoundRobin,   // How to distribute chunks
     // Other options: LowestLatency, HighestBandwidth, WeightedRoundRobin
-    
-    // Optional features
-    EnableCompression:      true,                // Enable data compression
-    CompressionLevel:       6,                   // Compression level (0-9)
-    EnableEncryption:       false,               // Enable encryption
-    EncryptionKey:          []byte("your-key"),  // Encryption key
 }
 
 // Create a session with custom config
@@ -107,12 +102,36 @@ InvMux takes data written to a logical stream, chunks it into smaller packets, a
 
 ### Distribution Policies
 
-InvMux supports multiple distribution policies:
+InvMux supports multiple distribution policies, all fully implemented:
 
-- **RoundRobin**: Distributes chunks evenly across all connections
-- **LowestLatency**: Sends chunks through the connection with the lowest latency
-- **HighestBandwidth**: Sends chunks through the connection with the highest bandwidth
-- **WeightedRoundRobin**: Distributes chunks based on connection weights
+- **RoundRobin**: Distributes chunks evenly across all connections in a circular fashion
+- **LowestLatency**: Sends chunks through the connection with the lowest measured latency
+- **HighestBandwidth**: Sends chunks through the connection with the highest measured bandwidth
+- **WeightedRoundRobin**: Distributes chunks based on assigned connection weights
+
+You can set weights for specific connections:
+
+```go
+// Set weight for a specific connection
+session.SetConnectionWeight("connection-id", 10) // This connection gets 10x more traffic
+```
+
+The library automatically monitors connection performance and updates latency and bandwidth measurements for intelligent routing decisions.
+
+### Connection Statistics
+
+You can access detailed statistics for all connections:
+
+```go
+// Get stats for all connections
+stats := session.GetConnectionStats()
+
+// Get connections sorted by latency (lowest first)
+sortedByLatency := session.SortConnectionsByLatency()
+
+// Get connections sorted by bandwidth (highest first)
+sortedByBandwidth := session.SortConnectionsByBandwidth()
+```
 
 ## Performance Benefits
 
