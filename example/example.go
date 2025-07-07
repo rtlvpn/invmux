@@ -7,7 +7,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/yourusername/invmux"
+	"github.com/rtlvpn/invmux"
 )
 
 func main() {
