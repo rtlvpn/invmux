@@ -9,6 +9,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -128,14 +129,13 @@ func (p *DefaultConnectionPool) performHealthChecks(ctx context.Context) {
 	}
 }
 
-// RoundRobinBalancer implements round-robin connection selection
+// RoundRobinBalancer implements round-robin load balancing
 type RoundRobinBalancer struct {
-	name  string
-	index int64
-	mu    sync.Mutex
+	name    string
+	counter int64
 }
 
-// NewRoundRobinBalancer creates a new round-robin balancer
+// NewRoundRobinBalancer creates a new round-robin load balancer
 func NewRoundRobinBalancer() *RoundRobinBalancer {
 	return &RoundRobinBalancer{
 		name: "round-robin",
@@ -146,111 +146,36 @@ func (b *RoundRobinBalancer) Name() string {
 	return b.name
 }
 
-func (b *RoundRobinBalancer) SelectConnection(connections []PluggableConnection, data []byte) (PluggableConnection, error) {
+func (b *RoundRobinBalancer) Select(connections []Connection, streamID uint32, data []byte) (Connection, error) {
 	if len(connections) == 0 {
-		return nil, errors.New("no connections available")
+		return nil, fmt.Errorf("no connections available")
 	}
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	// Simple round-robin
-	selectedIndex := b.index % int64(len(connections))
-	b.index++
-
-	return connections[selectedIndex], nil
+	
+	index := atomic.AddInt64(&b.counter, 1) % int64(len(connections))
+	return connections[index], nil
 }
 
-func (b *RoundRobinBalancer) UpdateStats(connID string, quality ConnectionQuality) {
+func (b *RoundRobinBalancer) OnConnectionAdded(conn Connection) {
+	// No specific action needed for round-robin
+}
+
+func (b *RoundRobinBalancer) OnConnectionRemoved(conn Connection) {
+	// No specific action needed for round-robin
+}
+
+func (b *RoundRobinBalancer) UpdateStats(conn Connection, quality *Quality) {
 	// Round-robin doesn't use stats
 }
 
-func (b *RoundRobinBalancer) OnConnectionAdded(conn PluggableConnection) {
-	// Nothing to do for round-robin
-}
-
-func (b *RoundRobinBalancer) OnConnectionRemoved(conn PluggableConnection) {
-	// Nothing to do for round-robin
-}
-
-// LatencyBasedBalancer selects connections based on latency
-type LatencyBasedBalancer struct {
-	name  string
-	stats map[string]ConnectionQuality
-	mu    sync.RWMutex
-}
-
-// NewLatencyBasedBalancer creates a new latency-based balancer
-func NewLatencyBasedBalancer() *LatencyBasedBalancer {
-	return &LatencyBasedBalancer{
-		name:  "latency-based",
-		stats: make(map[string]ConnectionQuality),
-	}
-}
-
-func (b *LatencyBasedBalancer) Name() string {
-	return b.name
-}
-
-func (b *LatencyBasedBalancer) SelectConnection(connections []PluggableConnection, data []byte) (PluggableConnection, error) {
-	if len(connections) == 0 {
-		return nil, errors.New("no connections available")
-	}
-
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	// Find connection with lowest latency
-	var bestConn PluggableConnection
-	var bestLatency time.Duration = time.Hour // Start with a very high value
-
-	for _, conn := range connections {
-		quality := conn.Quality()
-		if quality.Latency < bestLatency && quality.IsHealthy {
-			bestLatency = quality.Latency
-			bestConn = conn
-		}
-	}
-
-	if bestConn == nil {
-		// Fall back to first healthy connection
-		for _, conn := range connections {
-			if conn.Quality().IsHealthy {
-				return conn, nil
-			}
-		}
-		// If no healthy connections, use the first one
-		return connections[0], nil
-	}
-
-	return bestConn, nil
-}
-
-func (b *LatencyBasedBalancer) UpdateStats(connID string, quality ConnectionQuality) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.stats[connID] = quality
-}
-
-func (b *LatencyBasedBalancer) OnConnectionAdded(conn PluggableConnection) {
-	// Initialize stats
-	b.UpdateStats(conn.Metadata().RemoteAddress, conn.Quality())
-}
-
-func (b *LatencyBasedBalancer) OnConnectionRemoved(conn PluggableConnection) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	delete(b.stats, conn.Metadata().RemoteAddress)
-}
-
-// WeightedBalancer implements weighted connection selection
+// WeightedBalancer implements priority-based load balancing
 type WeightedBalancer struct {
-	name    string
-	weights map[string]int
-	mu      sync.RWMutex
+	name        string
+	weights     map[string]int
+	totalWeight int64
+	mu          sync.RWMutex
 }
 
-// NewWeightedBalancer creates a new weighted balancer
+// NewWeightedBalancer creates a new weighted load balancer
 func NewWeightedBalancer() *WeightedBalancer {
 	return &WeightedBalancer{
 		name:    "weighted",
@@ -262,254 +187,269 @@ func (b *WeightedBalancer) Name() string {
 	return b.name
 }
 
-func (b *WeightedBalancer) SelectConnection(connections []PluggableConnection, data []byte) (PluggableConnection, error) {
+func (b *WeightedBalancer) Select(connections []Connection, streamID uint32, data []byte) (Connection, error) {
 	if len(connections) == 0 {
-		return nil, errors.New("no connections available")
+		return nil, fmt.Errorf("no connections available")
 	}
-
+	
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-
-	// Calculate total weight
-	totalWeight := 0
+	
+	// Simple priority selection - choose highest priority connection
+	var best Connection
+	var bestPriority int = -1
+	
 	for _, conn := range connections {
-		weight := b.weights[conn.Metadata().RemoteAddress]
-		if weight <= 0 {
-			weight = 1 // Default weight
+		if conn.Priority() > bestPriority && conn.Quality().IsHealthy {
+			best = conn
+			bestPriority = conn.Priority()
 		}
-		totalWeight += weight
 	}
-
-	if totalWeight == 0 {
-		// Fall back to first connection
+	
+	if best == nil {
+		// Fallback to first available connection
 		return connections[0], nil
 	}
-
-	// Select based on weighted random
-	target := rand.Intn(totalWeight)
-	current := 0
-
-	for _, conn := range connections {
-		weight := b.weights[conn.Metadata().RemoteAddress]
-		if weight <= 0 {
-			weight = 1
-		}
-		current += weight
-		if current > target {
-			return conn, nil
-		}
-	}
-
-	// Should never reach here, but fall back to first connection
-	return connections[0], nil
+	
+	return best, nil
 }
 
-func (b *WeightedBalancer) SetWeight(connID string, weight int) {
+func (b *WeightedBalancer) OnConnectionAdded(conn Connection) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.weights[connID] = weight
+	b.weights[conn.ID()] = conn.Priority()
+	b.recalculateWeight()
 }
 
-func (b *WeightedBalancer) UpdateStats(connID string, quality ConnectionQuality) {
-	// Could use quality metrics to auto-adjust weights
-}
-
-func (b *WeightedBalancer) OnConnectionAdded(conn PluggableConnection) {
-	// Set default weight if not specified
-	connID := conn.Metadata().RemoteAddress
+func (b *WeightedBalancer) OnConnectionRemoved(conn Connection) {
 	b.mu.Lock()
-	if _, exists := b.weights[connID]; !exists {
-		b.weights[connID] = 1
+	defer b.mu.Unlock()
+	delete(b.weights, conn.ID())
+	b.recalculateWeight()
+}
+
+func (b *WeightedBalancer) UpdateStats(conn Connection, quality *Quality) {
+	// Can be used to adjust weights based on performance
+}
+
+func (b *WeightedBalancer) recalculateWeight() {
+	total := int64(0)
+	for _, weight := range b.weights {
+		total += int64(weight)
 	}
+	b.totalWeight = total
+}
+
+// RandomBalancer implements random load balancing
+type RandomBalancer struct {
+	name string
+	rand *rand.Rand
+	mu   sync.Mutex
+}
+
+// NewRandomBalancer creates a new random load balancer
+func NewRandomBalancer() *RandomBalancer {
+	return &RandomBalancer{
+		name: "random",
+		rand: rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
+}
+
+func (b *RandomBalancer) Name() string {
+	return b.name
+}
+
+func (b *RandomBalancer) Select(connections []Connection, streamID uint32, data []byte) (Connection, error) {
+	if len(connections) == 0 {
+		return nil, fmt.Errorf("no connections available")
+	}
+	
+	b.mu.Lock()
+	index := b.rand.Intn(len(connections))
 	b.mu.Unlock()
+	
+	return connections[index], nil
 }
 
-func (b *WeightedBalancer) OnConnectionRemoved(conn PluggableConnection) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	delete(b.weights, conn.Metadata().RemoteAddress)
-}
+func (b *RandomBalancer) OnConnectionAdded(conn Connection) {}
+func (b *RandomBalancer) OnConnectionRemoved(conn Connection) {}
+func (b *RandomBalancer) UpdateStats(conn Connection, quality *Quality) {}
 
-// DefaultErrorHandler provides basic error handling
-type DefaultErrorHandler struct{}
+// DefaultErrorHandler implements basic error handling
+type DefaultErrorHandler struct {
+	name string
+}
 
 // NewDefaultErrorHandler creates a new default error handler
 func NewDefaultErrorHandler() *DefaultErrorHandler {
-	return &DefaultErrorHandler{}
+	return &DefaultErrorHandler{
+		name: "default",
+	}
 }
 
-func (h *DefaultErrorHandler) HandleConnectionError(conn PluggableConnection, err error) ErrorAction {
-	if err == nil {
-		return ErrorActionIgnore
-	}
+func (h *DefaultErrorHandler) HandleConnectionError(conn Connection, err error) ErrorAction {
+	// For connection errors, try to reconnect
+	return ErrorActionReconnect
+}
 
-	// Check error type and decide action
-	if netErr, ok := err.(net.Error); ok {
-		if netErr.Timeout() {
-			return ErrorActionRetry
-		}
-		if netErr.Temporary() {
-			return ErrorActionRetry
-		}
-	}
-
-	// Check for common network errors
-	errStr := err.Error()
-	if strings.Contains(errStr, "connection refused") ||
-		strings.Contains(errStr, "no route to host") ||
-		strings.Contains(errStr, "network unreachable") {
-		return ErrorActionReconnect
-	}
-
-	if strings.Contains(errStr, "broken pipe") ||
-		strings.Contains(errStr, "connection reset") {
-		return ErrorActionRemoveConnection
-	}
-
-	// Default to retry for unknown errors
+func (h *DefaultErrorHandler) HandleStreamError(streamID uint32, err error) ErrorAction {
+	// For stream errors, retry first
 	return ErrorActionRetry
 }
 
-func (h *DefaultErrorHandler) HandleSessionError(session *EnhancedSession, err error) ErrorAction {
-	if err == nil {
-		return ErrorActionIgnore
-	}
-
-	// For session-level errors, usually we want to continue
-	return ErrorActionIgnore
+func (h *DefaultErrorHandler) HandleSessionError(err error) ErrorAction {
+	// For session errors, try to failover
+	return ErrorActionFailover
 }
 
-func (h *DefaultErrorHandler) HandleStreamError(stream *EnhancedStream, err error) ErrorAction {
-	if err == nil {
-		return ErrorActionIgnore
-	}
-
-	// For stream errors, usually ignore and let the stream handle it
-	return ErrorActionIgnore
-}
-
-// DefaultHealthMonitor provides basic health monitoring
+// DefaultHealthMonitor implements basic health monitoring
 type DefaultHealthMonitor struct {
-	thresholds HealthThresholds
+	name       string
+	thresholds *HealthThresholds
+	mu         sync.RWMutex
 	running    bool
-	stopCh     chan struct{}
-	mu         sync.Mutex
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
 // NewDefaultHealthMonitor creates a new default health monitor
 func NewDefaultHealthMonitor() *DefaultHealthMonitor {
 	return &DefaultHealthMonitor{
-		stopCh: make(chan struct{}),
+		name: "default",
+		thresholds: &HealthThresholds{
+			MaxLatency:    500 * time.Millisecond,
+			MinBandwidth:  1024, // 1KB/s
+			MaxPacketLoss: 0.05, // 5%
+			MaxErrorRate:  0.02, // 2%
+			MinScore:      0.7,  // 70%
+			MaxIdleTime:   60 * time.Second,
+			CheckInterval: 10 * time.Second,
+		},
 	}
 }
 
-func (m *DefaultHealthMonitor) StartMonitoring(session *EnhancedSession) error {
+func (m *DefaultHealthMonitor) StartMonitoring(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
+	
 	if m.running {
-		return errors.New("health monitoring already running")
+		return fmt.Errorf("monitoring already running")
 	}
-
+	
+	m.ctx, m.cancel = context.WithCancel(ctx)
 	m.running = true
-	go m.monitorLoop(session)
+	
+	// Start monitoring in background
+	go m.monitorLoop()
+	
 	return nil
 }
 
 func (m *DefaultHealthMonitor) StopMonitoring() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
+	
 	if !m.running {
 		return nil
 	}
-
+	
+	m.cancel()
 	m.running = false
-	close(m.stopCh)
-	m.stopCh = make(chan struct{}) // Reset for potential restart
 	return nil
 }
 
-func (m *DefaultHealthMonitor) CheckConnection(conn PluggableConnection) ConnectionQuality {
+func (m *DefaultHealthMonitor) CheckConnection(conn Connection) *Quality {
 	quality := conn.Quality()
-
-	// Update health status based on thresholds
-	quality.IsHealthy = true
-
+	
+	// Update health based on thresholds
+	healthy := true
+	score := 1.0
+	
 	if quality.Latency > m.thresholds.MaxLatency {
-		quality.IsHealthy = false
-		quality.HealthScore *= 0.5 // Reduce health score
+		healthy = false
+		score -= 0.3
 	}
-
-	if quality.UploadBandwidth+quality.DownloadBandwidth < m.thresholds.MinBandwidth {
-		quality.IsHealthy = false
-		quality.HealthScore *= 0.7
+	
+	if quality.Bandwidth < m.thresholds.MinBandwidth {
+		healthy = false
+		score -= 0.2
 	}
-
+	
 	if quality.PacketLoss > m.thresholds.MaxPacketLoss {
-		quality.IsHealthy = false
-		quality.HealthScore *= 0.6
+		healthy = false
+		score -= 0.3
 	}
-
-	if quality.ErrorRate > m.thresholds.MaxErrorRate {
-		quality.IsHealthy = false
-		quality.HealthScore *= 0.4
-	}
-
+	
 	if time.Since(quality.LastActivity) > m.thresholds.MaxIdleTime {
-		quality.IsHealthy = false
-		quality.HealthScore *= 0.3
+		healthy = false
+		score -= 0.2
 	}
-
-	if quality.HealthScore < m.thresholds.MinHealthScore {
-		quality.IsHealthy = false
-	}
-
+	
+	quality.IsHealthy = healthy
+	quality.Score = score
+	
 	return quality
 }
 
-func (m *DefaultHealthMonitor) SetHealthThresholds(thresholds HealthThresholds) {
+func (m *DefaultHealthMonitor) SetThresholds(thresholds *HealthThresholds) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.thresholds = thresholds
 }
 
-func (m *DefaultHealthMonitor) monitorLoop(session *EnhancedSession) {
-	ticker := time.NewTicker(m.thresholds.HealthCheckInterval)
-	defer ticker.Stop()
+func (m *DefaultHealthMonitor) OnUnhealthyConnection(conn Connection) {
+	// Default action: log unhealthy connection
+	fmt.Printf("Connection %s is unhealthy\n", conn.ID())
+}
 
+func (m *DefaultHealthMonitor) monitorLoop() {
+	ticker := time.NewTicker(m.thresholds.CheckInterval)
+	defer ticker.Stop()
+	
 	for {
 		select {
 		case <-ticker.C:
-			m.performHealthChecks(session)
-		case <-m.stopCh:
-			return
-		case <-session.ctx.Done():
+			// Health checking would happen here in a real implementation
+			// This is just a placeholder
+		case <-m.ctx.Done():
 			return
 		}
 	}
 }
 
-func (m *DefaultHealthMonitor) performHealthChecks(session *EnhancedSession) {
-	connections := session.GetConnections()
+// PassthroughMiddleware is a no-op middleware that passes data through unchanged
+type PassthroughMiddleware struct {
+	name string
+}
 
-	for _, conn := range connections {
-		quality := m.CheckConnection(conn)
-
-		// Update balancer with new stats
-		if session.balancer != nil {
-			session.balancer.UpdateStats(conn.Metadata().RemoteAddress, quality)
-		}
-
-		// Log unhealthy connections
-		if !quality.IsHealthy {
-			log.Printf("Connection %s is unhealthy (score: %.2f)",
-				conn.Metadata().RemoteAddress, quality.HealthScore)
-		}
+// NewPassthroughMiddleware creates a new passthrough middleware
+func NewPassthroughMiddleware() *PassthroughMiddleware {
+	return &PassthroughMiddleware{
+		name: "passthrough",
 	}
 }
 
-// CompressionMiddleware compresses/decompresses data
+func (m *PassthroughMiddleware) Name() string {
+	return m.name
+}
+
+func (m *PassthroughMiddleware) ProcessOutbound(streamID uint32, data []byte) ([]byte, error) {
+	return data, nil
+}
+
+func (m *PassthroughMiddleware) ProcessInbound(streamID uint32, data []byte) ([]byte, error) {
+	return data, nil
+}
+
+func (m *PassthroughMiddleware) OnStreamOpen(streamID uint32) error {
+	return nil
+}
+
+func (m *PassthroughMiddleware) OnStreamClose(streamID uint32) error {
+	return nil
+}
+
+// CompressionMiddleware provides simple compression (placeholder implementation)
 type CompressionMiddleware struct {
 	name string
 }
@@ -525,36 +465,14 @@ func (m *CompressionMiddleware) Name() string {
 	return m.name
 }
 
-func (m *CompressionMiddleware) ProcessWrite(streamID uint32, data []byte) ([]byte, error) {
-	// Simple compression simulation (in real implementation, use gzip/lz4/etc.)
-	if len(data) < 100 {
-		return data, nil // Don't compress small data
-	}
-
-	// Simulate compression by adding a header
-	compressed := make([]byte, len(data)+4)
-	compressed[0] = 0xC0 // Compression marker
-	compressed[1] = 0x01 // Compression type
-	compressed[2] = byte(len(data) >> 8)
-	compressed[3] = byte(len(data))
-	copy(compressed[4:], data)
-
-	return compressed, nil
+func (m *CompressionMiddleware) ProcessOutbound(streamID uint32, data []byte) ([]byte, error) {
+	// Placeholder: In real implementation, compress data here
+	return data, nil
 }
 
-func (m *CompressionMiddleware) ProcessRead(streamID uint32, data []byte) ([]byte, error) {
-	// Check if data is compressed
-	if len(data) < 4 || data[0] != 0xC0 {
-		return data, nil // Not compressed
-	}
-
-	// Extract original data
-	originalSize := int(data[2])<<8 | int(data[3])
-	if len(data) < 4+originalSize {
-		return nil, errors.New("invalid compressed data")
-	}
-
-	return data[4 : 4+originalSize], nil
+func (m *CompressionMiddleware) ProcessInbound(streamID uint32, data []byte) ([]byte, error) {
+	// Placeholder: In real implementation, decompress data here
+	return data, nil
 }
 
 func (m *CompressionMiddleware) OnStreamOpen(streamID uint32) error {
@@ -565,46 +483,68 @@ func (m *CompressionMiddleware) OnStreamClose(streamID uint32) error {
 	return nil
 }
 
-// EncryptionMiddleware provides simple encryption
-type EncryptionMiddleware struct {
-	name string
-	key  []byte
+// DefaultConnectionManager implements basic connection management
+type DefaultConnectionManager struct {
+	connections   map[string]Connection
+	autoReconnect bool
+	mu            sync.RWMutex
 }
 
-// NewEncryptionMiddleware creates a new encryption middleware
-func NewEncryptionMiddleware(key []byte) *EncryptionMiddleware {
-	return &EncryptionMiddleware{
-		name: "encryption",
-		key:  key,
+// NewDefaultConnectionManager creates a new default connection manager
+func NewDefaultConnectionManager() *DefaultConnectionManager {
+	return &DefaultConnectionManager{
+		connections:   make(map[string]Connection),
+		autoReconnect: true,
 	}
 }
 
-func (m *EncryptionMiddleware) Name() string {
-	return m.name
-}
-
-func (m *EncryptionMiddleware) ProcessWrite(streamID uint32, data []byte) ([]byte, error) {
-	// Simple XOR encryption (in real implementation, use AES/ChaCha20/etc.)
-	encrypted := make([]byte, len(data))
-	for i, b := range data {
-		encrypted[i] = b ^ m.key[i%len(m.key)]
-	}
-	return encrypted, nil
-}
-
-func (m *EncryptionMiddleware) ProcessRead(streamID uint32, data []byte) ([]byte, error) {
-	// XOR decryption (same as encryption for XOR)
-	decrypted := make([]byte, len(data))
-	for i, b := range data {
-		decrypted[i] = b ^ m.key[i%len(m.key)]
-	}
-	return decrypted, nil
-}
-
-func (m *EncryptionMiddleware) OnStreamOpen(streamID uint32) error {
+func (m *DefaultConnectionManager) AddConnection(conn Connection) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.connections[conn.ID()] = conn
 	return nil
 }
 
-func (m *EncryptionMiddleware) OnStreamClose(streamID uint32) error {
+func (m *DefaultConnectionManager) RemoveConnection(connID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.connections, connID)
 	return nil
+}
+
+func (m *DefaultConnectionManager) GetConnection(connID string) (Connection, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	conn, ok := m.connections[connID]
+	return conn, ok
+}
+
+func (m *DefaultConnectionManager) GetHealthyConnections() []Connection {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	
+	var healthy []Connection
+	for _, conn := range m.connections {
+		if conn.Quality().IsHealthy {
+			healthy = append(healthy, conn)
+		}
+	}
+	return healthy
+}
+
+func (m *DefaultConnectionManager) GetAllConnections() []Connection {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	
+	connections := make([]Connection, 0, len(m.connections))
+	for _, conn := range m.connections {
+		connections = append(connections, conn)
+	}
+	return connections
+}
+
+func (m *DefaultConnectionManager) SetAutoReconnect(enabled bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.autoReconnect = enabled
 }

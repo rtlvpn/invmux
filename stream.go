@@ -1,277 +1,296 @@
 package invmux
 
 import (
-	"fmt"
+	"errors"
 	"io"
-	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// Stream represents a logical bidirectional connection
-type Stream struct {
+var (
+	ErrStreamClosed = errors.New("stream closed")
+	ErrWriteTimeout = errors.New("write timeout")
+	ErrReadTimeout  = errors.New("read timeout")
+)
+
+// stream implements the Stream interface
+type stream struct {
+	session *session
 	id      uint32
-	session *Session
 
-	// Read related
-	readBuffer       []byte
-	readLock         sync.Mutex
-	nextReadChunk    uint16
-	readDeadline     time.Time
-	readNotifyCh     chan struct{}
-	readShutdown     bool
-	outOfOrderChunks map[uint16][]byte // For storing out-of-order chunks
+	// Buffer management
+	readBuffer  []byte
+	readPos     int
+	readCond    *sync.Cond
+	readMu      sync.Mutex
 
-	// Write related
-	writeLock      sync.Mutex
+	writeBuffer []byte
+	writeMu     sync.Mutex
+
+	// Chunk management
 	nextWriteChunk uint16
-	writeDeadline  time.Time
-	writeShutdown  bool
-	writeBuffer    []byte
+	receivedChunks map[uint16][]byte
+	nextReadChunk  uint16
+	chunkMu        sync.Mutex
 
-	// Shared
+	// State management
+	closed    int32
 	closeOnce sync.Once
 	closeCh   chan struct{}
+
+	// Deadlines
+	readDeadline  time.Time
+	writeDeadline time.Time
+	deadlineMu    sync.RWMutex
+
+	// Statistics
+	bytesRead    int64
+	bytesWritten int64
 }
 
 // newStream creates a new stream
-func newStream(session *Session, id uint32) *Stream {
-	s := &Stream{
-		id:               id,
-		session:          session,
-		nextReadChunk:    0,
-		readNotifyCh:     make(chan struct{}, 1),
-		nextWriteChunk:   0,
-		closeCh:          make(chan struct{}),
-		outOfOrderChunks: make(map[uint16][]byte),
-		readBuffer:       make([]byte, 0, session.config.ReadBufferSize),
-		writeBuffer:      make([]byte, 0, session.config.WriteBufferSize),
+func newStream(session *session, id uint32) *stream {
+	s := &stream{
+		session:        session,
+		id:             id,
+		readBuffer:     make([]byte, 0, DefaultBufferSize),
+		writeBuffer:    make([]byte, 0, DefaultBufferSize),
+		receivedChunks: make(map[uint16][]byte),
+		closeCh:        make(chan struct{}),
 	}
+
+	s.readCond = sync.NewCond(&s.readMu)
 	return s
 }
 
-// StreamID returns the unique identifier for this stream
-func (s *Stream) StreamID() uint32 {
+// ID returns the stream ID
+func (s *stream) ID() uint32 {
 	return s.id
 }
 
-// Read implements io.Reader
-func (s *Stream) Read(b []byte) (n int, err error) {
-	s.readLock.Lock()
-	defer s.readLock.Unlock()
-
-	if len(s.readBuffer) == 0 {
-		if s.readShutdown {
-			return 0, io.EOF
-		}
-
-		// Wait for data to arrive
-		s.readLock.Unlock()
-
-		// Check for deadline
-		var timeout <-chan time.Time
-		if !s.readDeadline.IsZero() {
-			timeout = time.After(time.Until(s.readDeadline))
-		}
-
-		select {
-		case <-s.readNotifyCh:
-		case <-s.closeCh:
-			s.readLock.Lock()
-			return 0, io.EOF
-		case <-timeout:
-			s.readLock.Lock()
-			return 0, ErrTimeout
-		}
-
-		s.readLock.Lock()
-
-		// Double check if we have data now
-		if len(s.readBuffer) == 0 {
-			if s.readShutdown {
-				return 0, io.EOF
-			}
-			return 0, nil
-		}
-	}
-
-	// Copy data to the target buffer
-	n = copy(b, s.readBuffer)
-	s.readBuffer = s.readBuffer[n:]
-	return n, nil
+// Session returns the parent session
+func (s *stream) Session() Session {
+	return s.session
 }
 
-// Write implements io.Writer
-func (s *Stream) Write(b []byte) (n int, err error) {
-	s.writeLock.Lock()
-	defer s.writeLock.Unlock()
-
-	if s.writeShutdown {
-		return 0, ErrConnectionClosed
+// Read reads data from the stream
+func (s *stream) Read(b []byte) (n int, err error) {
+	if s.isClosed() {
+		return 0, ErrStreamClosed
 	}
 
-	// Check write deadline
-	if !s.writeDeadline.IsZero() && time.Now().After(s.writeDeadline) {
-		return 0, ErrTimeout
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
+
+	// Check deadline
+	s.deadlineMu.RLock()
+	deadline := s.readDeadline
+	s.deadlineMu.RUnlock()
+
+	for {
+		// Check if we have data in the buffer
+		if s.readPos < len(s.readBuffer) {
+			available := len(s.readBuffer) - s.readPos
+			if len(b) <= available {
+				// Can satisfy the entire request
+				copy(b, s.readBuffer[s.readPos:s.readPos+len(b)])
+				s.readPos += len(b)
+				atomic.AddInt64(&s.bytesRead, int64(len(b)))
+				return len(b), nil
+			} else {
+				// Partial read
+				copy(b, s.readBuffer[s.readPos:])
+				n = available
+				s.readPos = len(s.readBuffer)
+				atomic.AddInt64(&s.bytesRead, int64(n))
+				return n, nil
+			}
+		}
+
+		// No data available, check if stream is closed
+		if s.isClosed() {
+			return 0, io.EOF
+		}
+
+		// Check deadline
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			return 0, ErrReadTimeout
+		}
+
+		// Wait for data
+		if !deadline.IsZero() {
+			// Wait with timeout
+			done := make(chan struct{})
+			go func() {
+				s.readCond.Wait()
+				close(done)
+			}()
+
+			select {
+			case <-done:
+				// Continue to check for data
+			case <-time.After(time.Until(deadline)):
+				return 0, ErrReadTimeout
+			case <-s.closeCh:
+				return 0, ErrStreamClosed
+			}
+		} else {
+			// Wait indefinitely
+			s.readCond.Wait()
+		}
+	}
+}
+
+// Write writes data to the stream
+func (s *stream) Write(b []byte) (n int, err error) {
+	if s.isClosed() {
+		return 0, ErrStreamClosed
 	}
 
-	total := len(b)
-	remaining := total
-	sent := 0
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 
-	for remaining > 0 {
-		// Determine chunk size
-		chunkSize := int(s.session.config.MaxChunkSize)
-		if remaining < chunkSize {
-			chunkSize = remaining
+	// Check deadline
+	s.deadlineMu.RLock()
+	deadline := s.writeDeadline
+	s.deadlineMu.RUnlock()
+
+	if !deadline.IsZero() && time.Now().After(deadline) {
+		return 0, ErrWriteTimeout
+	}
+
+	// Split data into chunks and send
+	maxChunkSize := int(s.session.config.MaxChunkSize)
+	totalWritten := 0
+
+	for totalWritten < len(b) {
+		chunkSize := len(b) - totalWritten
+		if chunkSize > maxChunkSize {
+			chunkSize = maxChunkSize
 		}
 
-		// Apply the distribution policy
-		var err error
-		switch s.session.config.DistributionPolicy {
-		case RoundRobin:
-			// Default behavior already implemented in sendChunk
-			err = s.session.sendChunk(s.id, s.nextWriteChunk, b[sent:sent+chunkSize])
-		case LowestLatency:
-			// Send through the connection with lowest latency
-			err = s.session.sendChunkLowestLatency(s.id, s.nextWriteChunk, b[sent:sent+chunkSize])
-		case HighestBandwidth:
-			// Send through the connection with highest bandwidth
-			err = s.session.sendChunkHighestBandwidth(s.id, s.nextWriteChunk, b[sent:sent+chunkSize])
-		case WeightedRoundRobin:
-			// Send through connections based on their weights
-			err = s.session.sendChunkWeighted(s.id, s.nextWriteChunk, b[sent:sent+chunkSize])
-		default:
-			// Default to round robin
-			err = s.session.sendChunk(s.id, s.nextWriteChunk, b[sent:sent+chunkSize])
-		}
+		chunk := b[totalWritten : totalWritten+chunkSize]
 
+		// Get next chunk ID
+		chunkID := atomic.AddUint32((*uint32)(&s.nextWriteChunk), 1)
+
+		// Send chunk through session
+		err := s.session.sendData(s.id, uint16(chunkID), chunk)
 		if err != nil {
-			return sent, err
-		}
-
-		// Update counters
-		sent += chunkSize
-		remaining -= chunkSize
-		s.nextWriteChunk++
-	}
-
-	return total, nil
-}
-
-// receiveChunk adds a received chunk to the stream's read buffer
-func (s *Stream) receiveChunk(chunkID uint16, data []byte) {
-	s.readLock.Lock()
-	defer s.readLock.Unlock()
-
-	// Simple case: it's the next chunk we're expecting
-	if chunkID == s.nextReadChunk {
-		s.readBuffer = append(s.readBuffer, data...)
-		s.nextReadChunk++
-
-		// Check if we have any buffered out-of-order chunks that can now be processed
-		if s.session.config.EnableOutOfOrderProcessing {
-			for {
-				nextData, exists := s.outOfOrderChunks[s.nextReadChunk]
-				if !exists {
-					break
-				}
-
-				// Add the chunk to the read buffer
-				s.readBuffer = append(s.readBuffer, nextData...)
-				delete(s.outOfOrderChunks, s.nextReadChunk)
-				s.nextReadChunk++
+			if totalWritten == 0 {
+				return 0, err
 			}
+			return totalWritten, err
 		}
 
-		// Notify readers
-		select {
-		case s.readNotifyCh <- struct{}{}:
-		default:
+		totalWritten += chunkSize
+
+		// Check deadline during multi-chunk writes
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			if totalWritten == 0 {
+				return 0, ErrWriteTimeout
+			}
+			return totalWritten, ErrWriteTimeout
 		}
-		return
 	}
 
-	// Handle out-of-order chunks if enabled
-	if s.session.config.EnableOutOfOrderProcessing {
-		// Check if the chunk is within our window
-		if chunkID > s.nextReadChunk &&
-			chunkID < s.nextReadChunk+uint16(s.session.config.OutOfOrderWindowSize) {
-			// Store the chunk for later processing
-			s.outOfOrderChunks[chunkID] = data
-		}
-	}
-	// Otherwise, we just drop out-of-order chunks
+	atomic.AddInt64(&s.bytesWritten, int64(totalWritten))
+	return totalWritten, nil
 }
 
 // Close closes the stream
-func (s *Stream) Close() error {
+func (s *stream) Close() error {
 	s.closeOnce.Do(func() {
+		atomic.StoreInt32(&s.closed, 1)
 		close(s.closeCh)
-		s.readLock.Lock()
-		s.readShutdown = true
-		s.readLock.Unlock()
 
-		s.writeLock.Lock()
-		s.writeShutdown = true
-		s.writeLock.Unlock()
+		// Notify waiting readers
+		s.readCond.Broadcast()
 
 		// Remove from session
-		s.session.streamLock.Lock()
-		delete(s.session.streams, s.id)
-		s.session.streamLock.Unlock()
+		s.session.removeStream(s.id)
 	})
+
 	return nil
 }
 
-// SetDeadline implements net.Conn
-func (s *Stream) SetDeadline(t time.Time) error {
-	if err := s.SetReadDeadline(t); err != nil {
-		return err
+// receiveChunk processes a received data chunk
+func (s *stream) receiveChunk(chunkID uint16, data []byte) {
+	if s.isClosed() {
+		return
 	}
-	return s.SetWriteDeadline(t)
+
+	s.chunkMu.Lock()
+	defer s.chunkMu.Unlock()
+
+	// Store the chunk
+	s.receivedChunks[chunkID] = data
+
+	// Try to add consecutive chunks to the read buffer
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
+
+	for {
+		chunkData, exists := s.receivedChunks[s.nextReadChunk]
+		if !exists {
+			break
+		}
+
+		// Add chunk to read buffer
+		s.readBuffer = append(s.readBuffer, chunkData...)
+		delete(s.receivedChunks, s.nextReadChunk)
+		s.nextReadChunk++
+
+		// Notify readers
+		s.readCond.Broadcast()
+	}
 }
 
-// SetReadDeadline implements net.Conn
-func (s *Stream) SetReadDeadline(t time.Time) error {
-	s.readLock.Lock()
-	defer s.readLock.Unlock()
+// SetDeadline sets read and write deadlines
+func (s *stream) SetDeadline(t time.Time) error {
+	s.deadlineMu.Lock()
+	defer s.deadlineMu.Unlock()
 	s.readDeadline = t
-	return nil
-}
-
-// SetWriteDeadline implements net.Conn
-func (s *Stream) SetWriteDeadline(t time.Time) error {
-	s.writeLock.Lock()
-	defer s.writeLock.Unlock()
 	s.writeDeadline = t
 	return nil
 }
 
-// LocalAddr returns the local address of the stream
-// This is a placeholder implementation to satisfy the net.Conn interface
-func (s *Stream) LocalAddr() net.Addr {
-	return &invmuxAddr{s.id, "local"}
+// SetReadDeadline sets the read deadline
+func (s *stream) SetReadDeadline(t time.Time) error {
+	s.deadlineMu.Lock()
+	defer s.deadlineMu.Unlock()
+	s.readDeadline = t
+	return nil
 }
 
-// RemoteAddr returns the remote address of the stream
-// This is a placeholder implementation to satisfy the net.Conn interface
-func (s *Stream) RemoteAddr() net.Addr {
-	return &invmuxAddr{s.id, "remote"}
+// SetWriteDeadline sets the write deadline
+func (s *stream) SetWriteDeadline(t time.Time) error {
+	s.deadlineMu.Lock()
+	defer s.deadlineMu.Unlock()
+	s.writeDeadline = t
+	return nil
 }
 
-// invmuxAddr implements the net.Addr interface for a stream
-type invmuxAddr struct {
-	id   uint32
-	side string
+// isClosed returns true if the stream is closed
+func (s *stream) isClosed() bool {
+	return atomic.LoadInt32(&s.closed) == 1
 }
 
-// Network returns the network name
-func (a *invmuxAddr) Network() string {
-	return "invmux"
+// Stats returns stream statistics
+func (s *stream) Stats() StreamStats {
+	return StreamStats{
+		ID:           s.id,
+		BytesRead:    atomic.LoadInt64(&s.bytesRead),
+		BytesWritten: atomic.LoadInt64(&s.bytesWritten),
+		IsClosed:     s.isClosed(),
+	}
 }
 
-// String returns a string representation of the address
-func (a *invmuxAddr) String() string {
-	return fmt.Sprintf("invmux:%s:%d", a.side, a.id)
+// StreamStats contains stream statistics
+type StreamStats struct {
+	ID           uint32
+	BytesRead    int64
+	BytesWritten int64
+	IsClosed     bool
 }

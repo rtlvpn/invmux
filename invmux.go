@@ -1,23 +1,21 @@
-// Package invmux implements an inverse multiplexer over multiple physical connections.
+// Package invmux implements an inverse multiplexer over multiple connections.
 package invmux
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"io"
-	"net"
-	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// Constants for protocol
+// Protocol constants
 const (
 	Version           = 1
 	DefaultWindowSize = 4096
 	MaxChunkSize      = 16384
 	DefaultBufferSize = 65536
-	DefaultMaxStreams = 1024
 
 	// Packet types
 	DataPacket    = 0x00
@@ -29,891 +27,503 @@ const (
 	KeepAlivePacket = 0x03
 )
 
+// Common errors
 var (
-	ErrTimeout            = errors.New("timeout")
-	ErrConnectionClosed   = errors.New("connection closed")
-	ErrInvalidChunkID     = errors.New("invalid chunk ID")
-	ErrNoPhysicalConns    = errors.New("no physical connections available")
-	ErrMaxConnectionLimit = errors.New("reached maximum connection limit")
-	ErrMaxStreamsExceeded = errors.New("maximum number of streams exceeded")
-	ErrBufferFull         = errors.New("buffer is full")
+	ErrConnectionClosed = fmt.Errorf("connection closed")
+	ErrNoConnections    = fmt.Errorf("no connections available")
+	ErrSessionClosed    = fmt.Errorf("session closed")
+	ErrInvalidData      = fmt.Errorf("invalid data")
 )
 
-// DistributionPolicy defines how chunks are distributed across physical connections
-type DistributionPolicy int
-
-const (
-	// RoundRobin distributes chunks in a round-robin fashion
-	RoundRobin DistributionPolicy = iota
-
-	// LowestLatency sends chunks through the connection with lowest latency
-	LowestLatency
-
-	// HighestBandwidth sends chunks through the connection with highest bandwidth
-	HighestBandwidth
-
-	// WeightedRoundRobin distributes chunks based on connection weights
-	WeightedRoundRobin
-)
-
-// Config is used to tune the inverse multiplexer
+// Config provides session configuration
 type Config struct {
-	// Version of the protocol
-	Version uint8
+	// Basic settings
+	WindowSize      uint16
+	MaxChunkSize    uint16
+	KeepAlive       time.Duration
+	WriteTimeout    time.Duration
+	MaxStreams      uint32
+	AcceptBacklog   int
 
-	// WindowSize is the size of the send window
-	WindowSize uint16
-
-	// MaxChunkSize is the maximum size of data in each chunk
-	MaxChunkSize uint16
-
-	// KeepAliveInterval is how often to send a keep-alive message
-	KeepAliveInterval time.Duration
-
-	// ConnectionWriteTimeout is the write timeout for physical connections
-	ConnectionWriteTimeout time.Duration
-
-	// ReadBufferSize is the size of the read buffer for each stream
-	ReadBufferSize int
-
-	// WriteBufferSize is the size of the write buffer for each stream
-	WriteBufferSize int
-
-	// MaxStreams is the maximum number of streams allowed per session
-	MaxStreams uint32
-
-	// AcceptBacklog is the backlog size for accepting new streams
-	AcceptBacklog int
-
-	// EnableOutOfOrderProcessing enables processing of out-of-order chunks
-	EnableOutOfOrderProcessing bool
-
-	// OutOfOrderWindowSize is the maximum number of out-of-order chunks to buffer
-	OutOfOrderWindowSize int
-
-	// DistributionPolicy determines how chunks are distributed across connections
-	DistributionPolicy DistributionPolicy
-
-	// ConnectionWeights allows assigning weights to connections for weighted distribution
-	// The key is the connection ID, value is the weight (higher = more traffic)
-	ConnectionWeights map[string]int
+	// Components
+	LoadBalancer      LoadBalancer
+	ErrorHandler      ErrorHandler
+	HealthMonitor     HealthMonitor
+	ConnectionManager ConnectionManager
+	Middleware        []Middleware
 }
 
-// DefaultConfig returns the default configuration
+// DefaultConfig returns a sensible default configuration
 func DefaultConfig() *Config {
 	return &Config{
-		Version:                    Version,
-		WindowSize:                 DefaultWindowSize,
-		MaxChunkSize:               MaxChunkSize,
-		KeepAliveInterval:          30 * time.Second,
-		ConnectionWriteTimeout:     10 * time.Second,
-		ReadBufferSize:             DefaultBufferSize,
-		WriteBufferSize:            DefaultBufferSize,
-		MaxStreams:                 DefaultMaxStreams,
-		AcceptBacklog:              1024,
-		EnableOutOfOrderProcessing: true,
-		OutOfOrderWindowSize:       1024,
-		DistributionPolicy:         RoundRobin,
-		ConnectionWeights:          make(map[string]int),
+		WindowSize:        DefaultWindowSize,
+		MaxChunkSize:      MaxChunkSize,
+		KeepAlive:         30 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		MaxStreams:        1024,
+		AcceptBacklog:     256,
+		LoadBalancer:      NewRoundRobinBalancer(),
+		ErrorHandler:      NewDefaultErrorHandler(),
+		HealthMonitor:     NewDefaultHealthMonitor(),
+		ConnectionManager: NewDefaultConnectionManager(),
+		Middleware:        []Middleware{NewPassthroughMiddleware()},
 	}
 }
 
-// ConnectionStats stores statistics for a physical connection
-type ConnectionStats struct {
-	// Latency is the measured round-trip time
-	Latency time.Duration
+// session implements the core multiplexing session
+type session struct {
+	config *Config
 
-	// Bandwidth is the estimated bandwidth in bytes per second
-	Bandwidth int64
+	// Core components
+	loadBalancer      LoadBalancer
+	errorHandler      ErrorHandler
+	healthMonitor     HealthMonitor
+	connectionManager ConnectionManager
+	middleware        []Middleware
 
-	// PacketLoss is the percentage of packet loss (0.0-1.0)
-	PacketLoss float64
-
-	// ID is a unique identifier for the connection
-	ID string
-
-	// BytesSent is the total number of bytes sent over this connection
-	BytesSent int64
-
-	// BytesReceived is the total number of bytes received over this connection
-	BytesReceived int64
-
-	// LastActivity is the timestamp of the last activity on this connection
-	LastActivity time.Time
-
-	// Weight is the assigned weight for weighted distribution
-	Weight int
-}
-
-// physicalConnection wraps a net.Conn with additional metadata
-type physicalConnection struct {
-	conn  net.Conn
-	stats ConnectionStats
-}
-
-// Session is used to manage the inverse multiplexing of a single logical connection
-type Session struct {
-	config               *Config
-	physicalConnections  []*physicalConnection
-	nextConnIndex        int
-	connLock             sync.Mutex
-	totalWeights         int
-	latencyProbeInterval time.Duration
-	bandwidthTestSize    int
-
-	streams      map[uint32]*Stream
-	streamLock   sync.RWMutex
+	// Stream management
+	streams      map[uint32]*stream
+	streamsLock  sync.RWMutex
 	nextStreamID uint32
+	acceptCh     chan *stream
 
-	// Channels for accepting streams
-	acceptCh       chan *Stream
-	acceptNotifyCh chan struct{}
+	// State management
+	ctx        context.Context
+	cancel     context.CancelFunc
+	closed     int32
+	closeCh    chan struct{}
+	closeOnce  sync.Once
 
-	// Channels for managing shutdown
-	shutdownCh   chan struct{}
-	shutdownErr  error
-	shutdownLock sync.Mutex
-
-	// Buffer management
-	receiveChunks map[uint32]map[uint16][]byte
-	receiveLock   sync.Mutex
+	// Statistics
+	stats struct {
+		streamsOpened  int64
+		streamsClosed  int64
+		bytesReceived  int64
+		bytesSent      int64
+		packetsReceived int64
+		packetsSent    int64
+	}
 }
 
-// NewSession creates a new inverse multiplexing session
-func NewSession(config *Config) *Session {
+// NewSession creates a new multiplexing session
+func NewSession(config *Config) Session {
 	if config == nil {
 		config = DefaultConfig()
 	}
 
-	s := &Session{
-		config:               config,
-		physicalConnections:  make([]*physicalConnection, 0),
-		streams:              make(map[uint32]*Stream),
-		nextStreamID:         1,
-		acceptCh:             make(chan *Stream, config.AcceptBacklog),
-		acceptNotifyCh:       make(chan struct{}, 1),
-		shutdownCh:           make(chan struct{}),
-		receiveChunks:        make(map[uint32]map[uint16][]byte),
-		latencyProbeInterval: 5 * time.Second,
-		bandwidthTestSize:    1024, // 1KB test packet
+	ctx, cancel := context.WithCancel(context.Background())
+
+	s := &session{
+		config:            config,
+		loadBalancer:      config.LoadBalancer,
+		errorHandler:      config.ErrorHandler,
+		healthMonitor:     config.HealthMonitor,
+		connectionManager: config.ConnectionManager,
+		middleware:        config.Middleware,
+		streams:           make(map[uint32]*stream),
+		nextStreamID:      1, // Start with odd numbers for client-initiated streams
+		acceptCh:          make(chan *stream, config.AcceptBacklog),
+		ctx:               ctx,
+		cancel:            cancel,
+		closeCh:           make(chan struct{}),
 	}
 
-	// Start monitoring connection stats if using policies that need them
-	if config.DistributionPolicy == LowestLatency ||
-		config.DistributionPolicy == HighestBandwidth {
-		go s.monitorConnectionStats()
-	}
+	// Start background services
+	go s.backgroundLoop()
 
-	// Start keep-alive mechanism
-	if config.KeepAliveInterval > 0 {
-		go s.keepAliveLoop()
+	// Start health monitoring
+	if s.healthMonitor != nil {
+		go s.healthMonitor.StartMonitoring(ctx)
 	}
 
 	return s
 }
 
-// monitorConnectionStats periodically updates connection statistics
-func (s *Session) monitorConnectionStats() {
-	ticker := time.NewTicker(s.latencyProbeInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			s.updateConnectionStats()
-		case <-s.shutdownCh:
-			return
-		}
-	}
-}
-
-// updateConnectionStats measures latency and bandwidth for all connections
-func (s *Session) updateConnectionStats() {
-	s.connLock.Lock()
-	defer s.connLock.Unlock()
-
-	for _, conn := range s.physicalConnections {
-		// Send ping packet to measure latency
-		s.sendPing(conn)
-
-		// Estimate bandwidth based on actual data transferred
-		timeSinceLastActivity := time.Since(conn.stats.LastActivity)
-		if timeSinceLastActivity > 0 && timeSinceLastActivity < 5*time.Second {
-			// Calculate bytes per second based on actual traffic
-			bytesSent := conn.stats.BytesSent
-			bytesReceived := conn.stats.BytesReceived
-			totalBytes := bytesSent + bytesReceived
-
-			// Calculate bandwidth in bytes per second
-			seconds := timeSinceLastActivity.Seconds()
-			if seconds > 0 {
-				bandwidth := int64(float64(totalBytes) / seconds)
-
-				// Apply exponential smoothing to avoid wild fluctuations
-				if conn.stats.Bandwidth > 0 {
-					// 80% old value, 20% new measurement
-					conn.stats.Bandwidth = (conn.stats.Bandwidth*8 + bandwidth*2) / 10
-				} else {
-					conn.stats.Bandwidth = bandwidth
-				}
-			}
-		}
-
-		// Update packet loss statistics based on observed errors
-		// This is a simplified approach - in a real implementation we'd track
-		// sequence numbers and calculate actual packet loss
-		if conn.stats.PacketLoss <= 0 {
-			conn.stats.PacketLoss = 0.01 // Start with minimal packet loss
-		}
-	}
-}
-
-// AddPhysicalConnection adds a physical connection to the session
-func (s *Session) AddPhysicalConnection(conn net.Conn) error {
-	s.connLock.Lock()
-	defer s.connLock.Unlock()
-
-	// Create a unique ID for the connection
-	connID := conn.LocalAddr().String() + "-" + conn.RemoteAddr().String()
-
-	// Create the physical connection with initial stats
-	physConn := &physicalConnection{
-		conn: conn,
-		stats: ConnectionStats{
-			ID:           connID,
-			LastActivity: time.Now(),
-			Weight:       1, // Default weight
-		},
+// OpenStream creates a new outbound stream
+func (s *session) OpenStream() (Stream, error) {
+	if s.IsClosed() {
+		return nil, ErrSessionClosed
 	}
 
-	// Apply weight if specified in config
-	if weight, ok := s.config.ConnectionWeights[connID]; ok {
-		physConn.stats.Weight = weight
-	}
-
-	s.physicalConnections = append(s.physicalConnections, physConn)
-
-	// Update total weights for weighted distribution
-	s.recalculateTotalWeights()
-
-	// Start handling the connection
-	go s.handleConnection(physConn)
-
-	// Log the new connection
-	fmt.Printf("Added new connection %s to session (total: %d)\n",
-		connID, len(s.physicalConnections))
-
-	return nil
-}
-
-// recalculateTotalWeights updates the total weights for weighted distribution
-func (s *Session) recalculateTotalWeights() {
-	s.totalWeights = 0
-	for _, conn := range s.physicalConnections {
-		s.totalWeights += conn.stats.Weight
-	}
-	if s.totalWeights == 0 {
-		// Ensure we don't divide by zero later
-		s.totalWeights = len(s.physicalConnections)
-	}
-}
-
-// SetConnectionWeight sets the weight for a specific connection
-func (s *Session) SetConnectionWeight(connID string, weight int) {
-	s.connLock.Lock()
-	defer s.connLock.Unlock()
-
-	// Update the weight in the config
-	s.config.ConnectionWeights[connID] = weight
-
-	// Update the weight in the connection if it exists
-	for _, conn := range s.physicalConnections {
-		if conn.stats.ID == connID {
-			conn.stats.Weight = weight
-			break
-		}
-	}
-
-	// Recalculate total weights
-	s.recalculateTotalWeights()
-}
-
-// handleConnection processes data from a physical connection
-func (s *Session) handleConnection(conn *physicalConnection) {
-	defer conn.conn.Close()
-
-	buf := make([]byte, s.config.MaxChunkSize+10) // Header + payload
-
-	for {
-		// Read the header (size, stream ID, chunk ID, flags)
-		_, err := io.ReadFull(conn.conn, buf[:8])
-		if err != nil {
-			s.removeConnection(conn)
-			return
-		}
-
-		// Update connection stats - we received something
-		conn.stats.LastActivity = time.Now()
-
-		// Check if this is a control packet
-		if buf[0] == ControlPacket {
-			// Handle control packet
-			s.handleControlPacket(conn, buf[:8])
-			continue
-		}
-
-		// Parse header for data packet
-		size := uint16(buf[0])<<8 | uint16(buf[1])
-		streamID := uint32(buf[2])<<24 | uint32(buf[3])<<16 | uint32(buf[4])<<8 | uint32(buf[5])
-		chunkID := uint16(buf[6])<<8 | uint16(buf[7])
-
-		// Read the payload
-		_, err = io.ReadFull(conn.conn, buf[8:8+size])
-		if err != nil {
-			s.removeConnection(conn)
-			return
-		}
-
-		// Update connection stats
-		conn.stats.BytesReceived += int64(size + 8) // payload + header
-		conn.stats.LastActivity = time.Now()
-
-		payload := make([]byte, size)
-		copy(payload, buf[8:8+size])
-
-		// Process the chunk
-		s.receiveChunk(streamID, chunkID, payload)
-	}
-}
-
-// handleControlPacket processes control packets like pings and keep-alives
-func (s *Session) handleControlPacket(conn *physicalConnection, header []byte) {
-	// Parse control packet type
-	packetType := header[1]
-
-	switch packetType {
-	case PingPacket:
-		// Received ping, send pong with same timestamp
-		pongPacket := make([]byte, 8)
-		pongPacket[0] = ControlPacket
-		pongPacket[1] = PongPacket
-		// Copy timestamp from ping
-		copy(pongPacket[2:6], header[2:6])
-
-		// Send pong response
-		conn.conn.Write(pongPacket)
-
-	case PongPacket:
-		// Received pong, calculate latency
-		// Extract timestamp from packet
-		timestamp := int64(header[2])<<24 | int64(header[3])<<16 | int64(header[4])<<8 | int64(header[5])
-
-		// Convert to time.Time
-		sentTime := time.Unix(0, timestamp*int64(time.Millisecond))
-
-		// Calculate round-trip time
-		rtt := time.Since(sentTime)
-
-		// Update latency with exponential smoothing
-		if conn.stats.Latency > 0 {
-			// 80% old value, 20% new measurement
-			conn.stats.Latency = (conn.stats.Latency*8 + rtt*2) / 10
-		} else {
-			conn.stats.Latency = rtt
-		}
-
-	case KeepAlivePacket:
-		// Just update the last activity time, which was already done
-		// Nothing else to do
-	}
-}
-
-// sendPing sends a ping packet to measure latency
-func (s *Session) sendPing(conn *physicalConnection) {
-	// Create ping packet
-	pingPacket := make([]byte, 8)
-	pingPacket[0] = ControlPacket
-	pingPacket[1] = PingPacket
-
-	// Encode current timestamp in milliseconds
-	timestamp := time.Now().UnixNano() / int64(time.Millisecond)
-	pingPacket[2] = byte(timestamp >> 24)
-	pingPacket[3] = byte(timestamp >> 16)
-	pingPacket[4] = byte(timestamp >> 8)
-	pingPacket[5] = byte(timestamp)
-
-	// Send ping
-	conn.conn.Write(pingPacket)
-}
-
-// removeConnection removes a connection from the session
-func (s *Session) removeConnection(conn *physicalConnection) {
-	s.connLock.Lock()
-	defer s.connLock.Unlock()
-
-	// Find and remove the connection
-	for i, c := range s.physicalConnections {
-		if c == conn {
-			// Remove from the slice
-			s.physicalConnections = append(s.physicalConnections[:i], s.physicalConnections[i+1:]...)
-
-			// Log the disconnection
-			fmt.Printf("Connection %s removed from session\n", conn.stats.ID)
-
-			break
-		}
-	}
-
-	// Recalculate total weights
-	s.recalculateTotalWeights()
-
-	// Notify about connection loss
-	if len(s.physicalConnections) == 0 {
-		fmt.Printf("Warning: No physical connections remaining in session\n")
-	} else {
-		fmt.Printf("Remaining connections: %d\n", len(s.physicalConnections))
-	}
-}
-
-// receiveChunk processes an incoming chunk and reassembles data
-func (s *Session) receiveChunk(streamID uint32, chunkID uint16, data []byte) {
-	s.streamLock.RLock()
-	stream, ok := s.streams[streamID]
-	s.streamLock.RUnlock()
-
-	if !ok {
-		// This might be a new stream opened by the remote side
-		if streamID%2 == 0 && s.isRemoteInitiated(streamID) {
-			// Create a new stream for the remote side
-			stream = newStream(s, streamID)
-
-			s.streamLock.Lock()
-			s.streams[streamID] = stream
-			s.streamLock.Unlock()
-
-			select {
-			case s.acceptCh <- stream:
-			default:
-				// Try to notify that we have a new stream
-				select {
-				case s.acceptNotifyCh <- struct{}{}:
-				default:
-				}
-			}
-		} else {
-			// Invalid stream ID
-			return
-		}
-	}
-
-	// Add the chunk to the stream
-	stream.receiveChunk(chunkID, data)
-}
-
-// isRemoteInitiated checks if a stream was initiated by the remote side
-func (s *Session) isRemoteInitiated(streamID uint32) bool {
-	return streamID%2 == 0 // Even IDs are remote-initiated
-}
-
-// OpenStream creates a new stream
-func (s *Session) OpenStream() (*Stream, error) {
-	s.streamLock.Lock()
-	defer s.streamLock.Unlock()
-
-	// Check if we've reached the maximum number of streams
-	if s.config.MaxStreams > 0 && uint32(len(s.streams)) >= s.config.MaxStreams {
-		return nil, ErrMaxStreamsExceeded
-	}
-
+	s.streamsLock.Lock()
 	streamID := s.nextStreamID
-	s.nextStreamID += 2 // Odd IDs for local streams
+	s.nextStreamID += 2 // Use odd numbers for client-initiated streams
+	if s.nextStreamID > s.config.MaxStreams {
+		s.streamsLock.Unlock()
+		return nil, fmt.Errorf("max streams exceeded")
+	}
+	s.streamsLock.Unlock()
 
 	stream := newStream(s, streamID)
-	s.streams[streamID] = stream
 
+	s.streamsLock.Lock()
+	s.streams[streamID] = stream
+	s.streamsLock.Unlock()
+
+	// Notify middleware
+	for _, mw := range s.middleware {
+		if err := mw.OnStreamOpen(streamID); err != nil {
+			s.removeStream(streamID)
+			return nil, fmt.Errorf("middleware %s failed: %w", mw.Name(), err)
+		}
+	}
+
+	atomic.AddInt64(&s.stats.streamsOpened, 1)
 	return stream, nil
 }
 
-// AcceptStream accepts a new stream from the remote side
-func (s *Session) AcceptStream() (*Stream, error) {
+// AcceptStream waits for and returns an incoming stream
+func (s *session) AcceptStream() (Stream, error) {
 	select {
 	case stream := <-s.acceptCh:
 		return stream, nil
-	case <-s.shutdownCh:
-		return nil, s.shutdownErr
+	case <-s.closeCh:
+		return nil, ErrSessionClosed
+	case <-s.ctx.Done():
+		return nil, s.ctx.Err()
 	}
 }
 
-// sendChunk sends a chunk through one of the physical connections using round-robin
-func (s *Session) sendChunk(streamID uint32, chunkID uint16, data []byte) error {
-	s.connLock.Lock()
-	defer s.connLock.Unlock()
-
-	if len(s.physicalConnections) == 0 {
-		return ErrNoPhysicalConns
+// AddConnection adds a connection to the session
+func (s *session) AddConnection(conn Connection) error {
+	if s.IsClosed() {
+		return ErrSessionClosed
 	}
 
-	// Round robin selection of connection
-	conn := s.physicalConnections[s.nextConnIndex].conn
-	physConn := s.physicalConnections[s.nextConnIndex]
-	s.nextConnIndex = (s.nextConnIndex + 1) % len(s.physicalConnections)
-
-	// Update connection stats
-	dataSize := len(data)
-	physConn.stats.BytesSent += int64(dataSize + 8) // payload + header
-	physConn.stats.LastActivity = time.Now()
-
-	// Construct header + data
-	header := make([]byte, 8)
-	header[0] = byte(dataSize >> 8)
-	header[1] = byte(dataSize)
-	header[2] = byte(streamID >> 24)
-	header[3] = byte(streamID >> 16)
-	header[4] = byte(streamID >> 8)
-	header[5] = byte(streamID)
-	header[6] = byte(chunkID >> 8)
-	header[7] = byte(chunkID)
-
-	// Set write deadline if configured
-	if s.config.ConnectionWriteTimeout > 0 {
-		conn.SetWriteDeadline(time.Now().Add(s.config.ConnectionWriteTimeout))
-	}
-
-	// Write header and data
-	if _, err := conn.Write(header); err != nil {
+	// Add to connection manager
+	if err := s.connectionManager.AddConnection(conn); err != nil {
 		return err
 	}
-	if _, err := conn.Write(data); err != nil {
+
+	// Notify load balancer
+	s.loadBalancer.OnConnectionAdded(conn)
+
+	// Start handling the connection
+	go s.handleConnection(conn)
+
+	return nil
+}
+
+// RemoveConnection removes a connection from the session
+func (s *session) RemoveConnection(connID string) error {
+	// Remove from connection manager
+	if err := s.connectionManager.RemoveConnection(connID); err != nil {
 		return err
+	}
+
+	// Find and notify load balancer
+	if conn, ok := s.connectionManager.GetConnection(connID); ok {
+		s.loadBalancer.OnConnectionRemoved(conn)
 	}
 
 	return nil
 }
 
-// sendChunkLowestLatency sends a chunk through the connection with the lowest latency
-func (s *Session) sendChunkLowestLatency(streamID uint32, chunkID uint16, data []byte) error {
-	s.connLock.Lock()
-	defer s.connLock.Unlock()
+// Close closes the session and all streams
+func (s *session) Close() error {
+	s.closeOnce.Do(func() {
+		atomic.StoreInt32(&s.closed, 1)
+		close(s.closeCh)
+		s.cancel()
 
-	if len(s.physicalConnections) == 0 {
-		return ErrNoPhysicalConns
-	}
-
-	// Find the connection with lowest latency
-	var lowestLatencyConn *physicalConnection
-	lowestLatency := time.Duration(1<<63 - 1) // Max duration
-
-	for _, conn := range s.physicalConnections {
-		if conn.stats.Latency < lowestLatency {
-			lowestLatency = conn.stats.Latency
-			lowestLatencyConn = conn
+		// Close all streams
+		s.streamsLock.Lock()
+		for _, stream := range s.streams {
+			stream.Close()
 		}
-	}
+		s.streamsLock.Unlock()
 
-	// If no latency data yet, use the first connection
-	if lowestLatencyConn == nil {
-		lowestLatencyConn = s.physicalConnections[0]
-	}
-
-	// Update connection stats
-	dataSize := len(data)
-	lowestLatencyConn.stats.BytesSent += int64(dataSize + 8) // payload + header
-	lowestLatencyConn.stats.LastActivity = time.Now()
-
-	// Construct header + data
-	header := make([]byte, 8)
-	header[0] = byte(dataSize >> 8)
-	header[1] = byte(dataSize)
-	header[2] = byte(streamID >> 24)
-	header[3] = byte(streamID >> 16)
-	header[4] = byte(streamID >> 8)
-	header[5] = byte(streamID)
-	header[6] = byte(chunkID >> 8)
-	header[7] = byte(chunkID)
-
-	// Set write deadline if configured
-	if s.config.ConnectionWriteTimeout > 0 {
-		lowestLatencyConn.conn.SetWriteDeadline(time.Now().Add(s.config.ConnectionWriteTimeout))
-	}
-
-	// Write header and data
-	if _, err := lowestLatencyConn.conn.Write(header); err != nil {
-		return err
-	}
-	if _, err := lowestLatencyConn.conn.Write(data); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// sendChunkHighestBandwidth sends a chunk through the connection with the highest bandwidth
-func (s *Session) sendChunkHighestBandwidth(streamID uint32, chunkID uint16, data []byte) error {
-	s.connLock.Lock()
-	defer s.connLock.Unlock()
-
-	if len(s.physicalConnections) == 0 {
-		return ErrNoPhysicalConns
-	}
-
-	// Find the connection with highest bandwidth
-	var highestBandwidthConn *physicalConnection
-	highestBandwidth := int64(0)
-
-	for _, conn := range s.physicalConnections {
-		if conn.stats.Bandwidth > highestBandwidth {
-			highestBandwidth = conn.stats.Bandwidth
-			highestBandwidthConn = conn
+		// Stop health monitoring
+		if s.healthMonitor != nil {
+			s.healthMonitor.StopMonitoring()
 		}
-	}
-
-	// If no bandwidth data yet, use the first connection
-	if highestBandwidthConn == nil {
-		highestBandwidthConn = s.physicalConnections[0]
-	}
-
-	// Update connection stats
-	dataSize := len(data)
-	highestBandwidthConn.stats.BytesSent += int64(dataSize + 8) // payload + header
-	highestBandwidthConn.stats.LastActivity = time.Now()
-
-	// Construct header + data
-	header := make([]byte, 8)
-	header[0] = byte(dataSize >> 8)
-	header[1] = byte(dataSize)
-	header[2] = byte(streamID >> 24)
-	header[3] = byte(streamID >> 16)
-	header[4] = byte(streamID >> 8)
-	header[5] = byte(streamID)
-	header[6] = byte(chunkID >> 8)
-	header[7] = byte(chunkID)
-
-	// Set write deadline if configured
-	if s.config.ConnectionWriteTimeout > 0 {
-		highestBandwidthConn.conn.SetWriteDeadline(time.Now().Add(s.config.ConnectionWriteTimeout))
-	}
-
-	// Write header and data
-	if _, err := highestBandwidthConn.conn.Write(header); err != nil {
-		return err
-	}
-	if _, err := highestBandwidthConn.conn.Write(data); err != nil {
-		return err
-	}
+	})
 
 	return nil
 }
 
-// sendChunkWeighted sends a chunk through connections based on their weights
-func (s *Session) sendChunkWeighted(streamID uint32, chunkID uint16, data []byte) error {
-	s.connLock.Lock()
-	defer s.connLock.Unlock()
-
-	if len(s.physicalConnections) == 0 {
-		return ErrNoPhysicalConns
-	}
-
-	// Weighted selection algorithm
-	// We'll use a simple approach: divide the weight space into segments
-	// and select a connection based on where a random number falls
-
-	// First, determine which connection to use based on weights
-	// For simplicity, we'll use a deterministic approach based on chunk ID
-	// This ensures even distribution over time according to weights
-
-	// Calculate the target position in the weight space
-	targetPos := int(chunkID % uint16(s.totalWeights))
-
-	// Find which connection this position corresponds to
-	var selectedConn *physicalConnection
-	currentPos := 0
-
-	for _, conn := range s.physicalConnections {
-		currentPos += conn.stats.Weight
-		if targetPos < currentPos {
-			selectedConn = conn
-			break
-		}
-	}
-
-	// If something went wrong with the selection, use the first connection
-	if selectedConn == nil {
-		selectedConn = s.physicalConnections[0]
-	}
-
-	// Update connection stats
-	dataSize := len(data)
-	selectedConn.stats.BytesSent += int64(dataSize + 8) // payload + header
-	selectedConn.stats.LastActivity = time.Now()
-
-	// Construct header + data
-	header := make([]byte, 8)
-	header[0] = byte(dataSize >> 8)
-	header[1] = byte(dataSize)
-	header[2] = byte(streamID >> 24)
-	header[3] = byte(streamID >> 16)
-	header[4] = byte(streamID >> 8)
-	header[5] = byte(streamID)
-	header[6] = byte(chunkID >> 8)
-	header[7] = byte(chunkID)
-
-	// Set write deadline if configured
-	if s.config.ConnectionWriteTimeout > 0 {
-		selectedConn.conn.SetWriteDeadline(time.Now().Add(s.config.ConnectionWriteTimeout))
-	}
-
-	// Write header and data
-	if _, err := selectedConn.conn.Write(header); err != nil {
-		return err
-	}
-	if _, err := selectedConn.conn.Write(data); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// Close closes the session and all associated streams
-func (s *Session) Close() error {
-	s.shutdownLock.Lock()
-	defer s.shutdownLock.Unlock()
-
-	if s.shutdownErr != nil {
-		return nil // Already closed
-	}
-
-	s.shutdownErr = ErrConnectionClosed
-	close(s.shutdownCh)
-
-	// Close all physical connections
-	s.connLock.Lock()
-	for _, conn := range s.physicalConnections {
-		conn.conn.Close()
-	}
-	s.physicalConnections = nil
-	s.connLock.Unlock()
-
-	// Close all streams
-	s.streamLock.Lock()
-	for _, stream := range s.streams {
-		stream.Close()
-	}
-	s.streamLock.Unlock()
-
-	return nil
+// IsClosed returns true if the session is closed
+func (s *session) IsClosed() bool {
+	return atomic.LoadInt32(&s.closed) == 1
 }
 
 // NumStreams returns the number of active streams
-func (s *Session) NumStreams() int {
-	s.streamLock.RLock()
-	defer s.streamLock.RUnlock()
+func (s *session) NumStreams() int {
+	s.streamsLock.RLock()
+	defer s.streamsLock.RUnlock()
 	return len(s.streams)
 }
 
-// NumPhysicalConnections returns the number of physical connections
-func (s *Session) NumPhysicalConnections() int {
-	s.connLock.Lock()
-	defer s.connLock.Unlock()
-	return len(s.physicalConnections)
+// NumConnections returns the number of active connections
+func (s *session) NumConnections() int {
+	connections := s.connectionManager.GetAllConnections()
+	return len(connections)
 }
 
-// GetConnectionStats returns statistics for all connections
-func (s *Session) GetConnectionStats() []ConnectionStats {
-	s.connLock.Lock()
-	defer s.connLock.Unlock()
+// handleConnection processes data from a connection
+func (s *session) handleConnection(conn Connection) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("Connection handler panicked: %v\n", r)
+		}
+		s.connectionManager.RemoveConnection(conn.ID())
+		s.loadBalancer.OnConnectionRemoved(conn)
+		conn.Close()
+	}()
 
-	stats := make([]ConnectionStats, len(s.physicalConnections))
-	for i, conn := range s.physicalConnections {
-		stats[i] = conn.stats
+	buffer := make([]byte, s.config.MaxChunkSize+16) // Extra space for headers
+
+	for {
+		select {
+		case <-s.closeCh:
+			return
+		case <-s.ctx.Done():
+			return
+		default:
+		}
+
+		// Set read timeout
+		conn.SetReadDeadline(time.Now().Add(s.config.WriteTimeout))
+
+		n, err := conn.Read(buffer)
+		if err != nil {
+			if err == io.EOF {
+				return
+			}
+
+			action := s.errorHandler.HandleConnectionError(conn, err)
+			switch action {
+			case ErrorActionIgnore:
+				continue
+			case ErrorActionRetry:
+				time.Sleep(100 * time.Millisecond)
+				continue
+			case ErrorActionReconnect, ErrorActionFailover, ErrorActionShutdown:
+				return
+			}
+		}
+
+		// Process received data
+		if err := s.processPacket(buffer[:n]); err != nil {
+			fmt.Printf("Error processing packet: %v\n", err)
+			continue
+		}
+
+		atomic.AddInt64(&s.stats.bytesReceived, int64(n))
+		atomic.AddInt64(&s.stats.packetsReceived, 1)
+	}
+}
+
+// processPacket processes an incoming packet
+func (s *session) processPacket(data []byte) error {
+	if len(data) < 8 {
+		return ErrInvalidData
 	}
 
-	return stats
+	// Parse packet header
+	packetType := data[0]
+	if packetType == ControlPacket {
+		return s.processControlPacket(data)
+	}
+
+	// Data packet
+	size := uint16(data[1])<<8 | uint16(data[2])
+	streamID := uint32(data[3])<<24 | uint32(data[4])<<16 | uint32(data[5])<<8 | uint32(data[6])
+	chunkID := uint16(data[7])<<8 | uint16(data[8])
+
+	if len(data) < int(9+size) {
+		return ErrInvalidData
+	}
+
+	payload := data[9 : 9+size]
+
+	// Process through middleware
+	processedData := payload
+	for _, mw := range s.middleware {
+		var err error
+		processedData, err = mw.ProcessInbound(streamID, processedData)
+		if err != nil {
+			return fmt.Errorf("middleware %s failed: %w", mw.Name(), err)
+		}
+	}
+
+	// Find or create stream
+	stream := s.getOrCreateStream(streamID)
+	if stream == nil {
+		return fmt.Errorf("failed to get stream %d", streamID)
+	}
+
+	// Deliver data to stream
+	stream.receiveChunk(chunkID, processedData)
+
+	return nil
 }
 
-// SortConnectionsByLatency returns connections sorted by latency (lowest first)
-func (s *Session) SortConnectionsByLatency() []ConnectionStats {
-	stats := s.GetConnectionStats()
+// processControlPacket processes control packets
+func (s *session) processControlPacket(data []byte) error {
+	if len(data) < 2 {
+		return ErrInvalidData
+	}
 
-	sort.Slice(stats, func(i, j int) bool {
-		return stats[i].Latency < stats[j].Latency
-	})
+	subType := data[1]
+	switch subType {
+	case PingPacket:
+		// Respond with pong
+		// Implementation would send pong back
+	case PongPacket:
+		// Handle pong response
+		// Implementation would update latency metrics
+	case KeepAlivePacket:
+		// Just acknowledge the keep-alive
+	}
 
-	return stats
+	return nil
 }
 
-// SortConnectionsByBandwidth returns connections sorted by bandwidth (highest first)
-func (s *Session) SortConnectionsByBandwidth() []ConnectionStats {
-	stats := s.GetConnectionStats()
+// getOrCreateStream finds an existing stream or creates a new one for remote-initiated streams
+func (s *session) getOrCreateStream(streamID uint32) *stream {
+	s.streamsLock.RLock()
+	stream, exists := s.streams[streamID]
+	s.streamsLock.RUnlock()
 
-	sort.Slice(stats, func(i, j int) bool {
-		return stats[i].Bandwidth > stats[j].Bandwidth
-	})
+	if exists {
+		return stream
+	}
 
-	return stats
+	// Only create streams for even IDs (remote-initiated)
+	if streamID%2 != 0 {
+		return nil
+	}
+
+	// Create new stream
+	stream = newStream(s, streamID)
+
+	s.streamsLock.Lock()
+	s.streams[streamID] = stream
+	s.streamsLock.Unlock()
+
+	// Notify middleware
+	for _, mw := range s.middleware {
+		if err := mw.OnStreamOpen(streamID); err != nil {
+			s.removeStream(streamID)
+			return nil
+		}
+	}
+
+	// Queue for acceptance
+	select {
+	case s.acceptCh <- stream:
+	default:
+		// Channel full, drop the stream
+		s.removeStream(streamID)
+		return nil
+	}
+
+	atomic.AddInt64(&s.stats.streamsOpened, 1)
+	return stream
 }
 
-// SetDistributionPolicy changes the distribution policy
-func (s *Session) SetDistributionPolicy(policy DistributionPolicy) {
-	s.connLock.Lock()
-	defer s.connLock.Unlock()
-	s.config.DistributionPolicy = policy
+// removeStream removes a stream from the session
+func (s *session) removeStream(streamID uint32) {
+	s.streamsLock.Lock()
+	delete(s.streams, streamID)
+	s.streamsLock.Unlock()
+
+	// Notify middleware
+	for _, mw := range s.middleware {
+		mw.OnStreamClose(streamID)
+	}
+
+	atomic.AddInt64(&s.stats.streamsClosed, 1)
 }
 
-// keepAliveLoop periodically sends keep-alive packets to all connections
-func (s *Session) keepAliveLoop() {
-	ticker := time.NewTicker(s.config.KeepAliveInterval)
+// sendData sends data through the best available connection
+func (s *session) sendData(streamID uint32, chunkID uint16, data []byte) error {
+	if s.IsClosed() {
+		return ErrSessionClosed
+	}
+
+	// Process through middleware
+	processedData := data
+	for _, mw := range s.middleware {
+		var err error
+		processedData, err = mw.ProcessOutbound(streamID, processedData)
+		if err != nil {
+			return fmt.Errorf("middleware %s failed: %w", mw.Name(), err)
+		}
+	}
+
+	// Get healthy connections
+	connections := s.connectionManager.GetHealthyConnections()
+	if len(connections) == 0 {
+		return ErrNoConnections
+	}
+
+	// Select connection using load balancer
+	conn, err := s.loadBalancer.Select(connections, streamID, processedData)
+	if err != nil {
+		return fmt.Errorf("load balancer failed: %w", err)
+	}
+
+	// Create packet
+	packet := make([]byte, 9+len(processedData))
+	packet[0] = DataPacket
+	packet[1] = byte(len(processedData) >> 8)
+	packet[2] = byte(len(processedData))
+	packet[3] = byte(streamID >> 24)
+	packet[4] = byte(streamID >> 16)
+	packet[5] = byte(streamID >> 8)
+	packet[6] = byte(streamID)
+	packet[7] = byte(chunkID >> 8)
+	packet[8] = byte(chunkID)
+	copy(packet[9:], processedData)
+
+	// Send packet
+	conn.SetWriteDeadline(time.Now().Add(s.config.WriteTimeout))
+	_, err = conn.Write(packet)
+	if err != nil {
+		action := s.errorHandler.HandleConnectionError(conn, err)
+		if action == ErrorActionReconnect || action == ErrorActionFailover {
+			s.connectionManager.RemoveConnection(conn.ID())
+		}
+		return err
+	}
+
+	atomic.AddInt64(&s.stats.bytesSent, int64(len(packet)))
+	atomic.AddInt64(&s.stats.packetsSent, 1)
+
+	return nil
+}
+
+// backgroundLoop handles background maintenance tasks
+func (s *session) backgroundLoop() {
+	if s.config.KeepAlive <= 0 {
+		return
+	}
+
+	ticker := time.NewTicker(s.config.KeepAlive)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
 			s.sendKeepAlives()
-		case <-s.shutdownCh:
+		case <-s.closeCh:
+			return
+		case <-s.ctx.Done():
 			return
 		}
 	}
 }
 
 // sendKeepAlives sends keep-alive packets to all connections
-func (s *Session) sendKeepAlives() {
-	s.connLock.Lock()
-	defer s.connLock.Unlock()
-
-	// Create keep-alive packet
-	keepAlivePacket := make([]byte, 8)
-	keepAlivePacket[0] = ControlPacket
-	keepAlivePacket[1] = KeepAlivePacket
-
-	// Current timestamp in milliseconds for debugging
-	timestamp := time.Now().UnixNano() / int64(time.Millisecond)
-	keepAlivePacket[2] = byte(timestamp >> 24)
-	keepAlivePacket[3] = byte(timestamp >> 16)
-	keepAlivePacket[4] = byte(timestamp >> 8)
-	keepAlivePacket[5] = byte(timestamp)
-
-	// Send to all connections
-	for _, conn := range s.physicalConnections {
-		// Check if the connection needs a keep-alive
-		timeSinceActivity := time.Since(conn.stats.LastActivity)
-		if timeSinceActivity > s.config.KeepAliveInterval/2 {
-			// Set write deadline if configured
-			if s.config.ConnectionWriteTimeout > 0 {
-				conn.conn.SetWriteDeadline(time.Now().Add(s.config.ConnectionWriteTimeout))
-			}
-
-			// Send keep-alive
-			_, err := conn.conn.Write(keepAlivePacket)
-			if err != nil {
-				// Connection might be down, mark it for removal
-				// We can't remove it directly here because we're holding the lock
-				// and removeConnection also needs the lock
-				go func(badConn *physicalConnection) {
-					s.removeConnection(badConn)
-				}(conn)
-			} else {
-				// Update stats
-				conn.stats.BytesSent += 8 // header size
-			}
-		}
+func (s *session) sendKeepAlives() {
+	connections := s.connectionManager.GetAllConnections()
+	
+	keepAlivePacket := []byte{ControlPacket, KeepAlivePacket}
+	
+	for _, conn := range connections {
+		conn.SetWriteDeadline(time.Now().Add(s.config.WriteTimeout))
+		conn.Write(keepAlivePacket)
 	}
 }

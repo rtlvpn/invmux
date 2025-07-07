@@ -3,163 +3,125 @@ package invmux
 
 import (
 	"context"
-	"net"
+	"io"
 	"time"
 )
 
-// ConnectionProvider defines the interface for creating and managing connections
-type ConnectionProvider interface {
-	// Name returns the name of this connection provider
-	Name() string
-
-	// Dial creates a new connection to the specified address
-	Dial(ctx context.Context, address string) (PluggableConnection, error)
-
-	// Listen starts listening for incoming connections
-	Listen(ctx context.Context, address string) (ConnectionListener, error)
-
-	// SupportsAddress checks if this provider can handle the given address
-	SupportsAddress(address string) bool
-
-	// HealthCheck performs a quick health check on the provider
-	HealthCheck(ctx context.Context) error
-}
-
-// PluggableConnection extends net.Conn with additional metadata and capabilities
-type PluggableConnection interface {
-	net.Conn
-
-	// Provider returns the connection provider that created this connection
-	Provider() ConnectionProvider
-
-	// Metadata returns connection-specific metadata
-	Metadata() ConnectionMetadata
-
+// Connection represents an abstract connection that can carry data
+// This is the core abstraction that makes the system transport-agnostic
+type Connection interface {
+	io.ReadWriteCloser
+	
 	// Quality returns current connection quality metrics
-	Quality() ConnectionQuality
-
+	Quality() *Quality
+	
 	// Priority returns the priority of this connection (higher = more preferred)
 	Priority() int
-
+	
 	// SetPriority sets the priority of this connection
 	SetPriority(priority int)
-
-	// IsReliable indicates if this connection guarantees packet delivery
-	IsReliable() bool
-
-	// MaxMTU returns the maximum transmission unit for this connection
-	MaxMTU() int
+	
+	// ID returns a unique identifier for this connection
+	ID() string
+	
+	// Type returns the connection type (for informational purposes only)
+	Type() string
 }
 
-// ConnectionListener listens for incoming connections
-type ConnectionListener interface {
-	// Accept waits for and returns the next connection
-	Accept() (PluggableConnection, error)
+// ConnectionFactory creates new connections
+type ConnectionFactory interface {
+	// Name returns the factory name
+	Name() string
+	
+	// Dial creates a new connection
+	Dial(ctx context.Context, address string) (Connection, error)
+	
+	// Listen creates a listener for incoming connections
+	Listen(ctx context.Context, address string) (Listener, error)
+	
+	// CanHandle returns true if this factory can handle the given address
+	CanHandle(address string) bool
+}
 
+// Listener accepts incoming connections
+type Listener interface {
+	// Accept waits for and returns the next connection
+	Accept() (Connection, error)
+	
 	// Close closes the listener
 	Close() error
-
-	// Addr returns the listener's network address
-	Addr() net.Addr
-
-	// Provider returns the connection provider that created this listener
-	Provider() ConnectionProvider
+	
+	// Addr returns the listener's address as a string
+	Addr() string
 }
 
-// ConnectionMetadata contains metadata about a connection
-type ConnectionMetadata struct {
-	// Type describes the connection type (tcp, udp, dns, http, etc.)
-	Type string
-
-	// Protocol version or specific implementation details
-	Protocol string
-
-	// Remote address as known by the connection
-	RemoteAddress string
-
-	// Local address as known by the connection
-	LocalAddress string
-
-	// Capabilities of this connection
-	Capabilities []string
-
-	// Custom properties specific to the connection type
-	Properties map[string]interface{}
-
-	// Created timestamp
-	Created time.Time
-}
-
-// ConnectionQuality represents the current quality metrics of a connection
-type ConnectionQuality struct {
+// Quality represents connection quality metrics
+type Quality struct {
 	// Latency measurements
 	Latency         time.Duration
-	LatencyVariance time.Duration
-
-	// Bandwidth measurements (bytes per second)
-	UploadBandwidth   int64
-	DownloadBandwidth int64
-
+	Jitter          time.Duration
+	
+	// Throughput measurements
+	Bandwidth       int64 // bytes per second
+	
 	// Reliability metrics
-	PacketLoss    float64 // 0.0 to 1.0
-	ErrorRate     float64 // 0.0 to 1.0
-	ConnectionAge time.Duration
-	LastActivity  time.Time
-
-	// Health status
-	IsHealthy   bool
-	HealthScore float64 // 0.0 to 1.0, higher is better
-
-	// Connection-specific metrics
-	CustomMetrics map[string]float64
+	PacketLoss      float64 // 0.0 to 1.0
+	ErrorRate       float64 // 0.0 to 1.0
+	
+	// Health and activity
+	IsHealthy       bool
+	LastActivity    time.Time
+	
+	// Overall score (0.0 to 1.0, higher is better)
+	Score           float64
 }
 
-// StreamMiddleware allows custom processing of stream data
-type StreamMiddleware interface {
+// Middleware processes data flowing through streams
+type Middleware interface {
 	// Name returns the middleware name
 	Name() string
-
-	// ProcessWrite processes data being written to a stream
-	ProcessWrite(streamID uint32, data []byte) ([]byte, error)
-
-	// ProcessRead processes data being read from a stream
-	ProcessRead(streamID uint32, data []byte) ([]byte, error)
-
+	
+	// ProcessOutbound processes data being sent
+	ProcessOutbound(streamID uint32, data []byte) ([]byte, error)
+	
+	// ProcessInbound processes data being received
+	ProcessInbound(streamID uint32, data []byte) ([]byte, error)
+	
 	// OnStreamOpen is called when a new stream is opened
 	OnStreamOpen(streamID uint32) error
-
+	
 	// OnStreamClose is called when a stream is closed
 	OnStreamClose(streamID uint32) error
 }
 
-// ConnectionBalancer defines strategies for selecting connections
-type ConnectionBalancer interface {
+// LoadBalancer selects connections for sending data
+type LoadBalancer interface {
 	// Name returns the balancer name
 	Name() string
-
-	// SelectConnection chooses the best connection for sending data
-	SelectConnection(connections []PluggableConnection, data []byte) (PluggableConnection, error)
-
-	// UpdateStats updates the balancer with connection statistics
-	UpdateStats(connID string, quality ConnectionQuality)
-
+	
+	// Select chooses the best connection for sending data
+	Select(connections []Connection, streamID uint32, data []byte) (Connection, error)
+	
 	// OnConnectionAdded is called when a new connection is added
-	OnConnectionAdded(conn PluggableConnection)
-
+	OnConnectionAdded(conn Connection)
+	
 	// OnConnectionRemoved is called when a connection is removed
-	OnConnectionRemoved(conn PluggableConnection)
+	OnConnectionRemoved(conn Connection)
+	
+	// UpdateStats updates the balancer with connection statistics
+	UpdateStats(conn Connection, quality *Quality)
 }
 
-// ErrorHandler handles connection and session errors
+// ErrorHandler handles various types of errors
 type ErrorHandler interface {
 	// HandleConnectionError handles connection-specific errors
-	HandleConnectionError(conn PluggableConnection, err error) ErrorAction
-
-	// HandleSessionError handles session-level errors
-	HandleSessionError(session *EnhancedSession, err error) ErrorAction
-
+	HandleConnectionError(conn Connection, err error) ErrorAction
+	
 	// HandleStreamError handles stream-specific errors
-	HandleStreamError(stream *EnhancedStream, err error) ErrorAction
+	HandleStreamError(streamID uint32, err error) ErrorAction
+	
+	// HandleSessionError handles session-level errors
+	HandleSessionError(err error) ErrorAction
 }
 
 // ErrorAction defines what action to take when an error occurs
@@ -168,58 +130,104 @@ type ErrorAction int
 const (
 	ErrorActionIgnore ErrorAction = iota
 	ErrorActionRetry
-	ErrorActionRemoveConnection
 	ErrorActionReconnect
 	ErrorActionFailover
 	ErrorActionShutdown
 )
 
-// HealthMonitor monitors connection health and triggers recovery actions
+// HealthMonitor monitors connection health
 type HealthMonitor interface {
-	// StartMonitoring begins health monitoring for the session
-	StartMonitoring(session *EnhancedSession) error
-
+	// StartMonitoring begins health monitoring
+	StartMonitoring(ctx context.Context) error
+	
 	// StopMonitoring stops health monitoring
 	StopMonitoring() error
-
-	// CheckConnection performs a health check on a specific connection
-	CheckConnection(conn PluggableConnection) ConnectionQuality
-
-	// SetHealthThresholds sets the thresholds for determining connection health
-	SetHealthThresholds(thresholds HealthThresholds)
+	
+	// CheckConnection performs a health check on a connection
+	CheckConnection(conn Connection) *Quality
+	
+	// SetThresholds sets the health check thresholds
+	SetThresholds(thresholds *HealthThresholds)
+	
+	// OnUnhealthyConnection is called when a connection becomes unhealthy
+	OnUnhealthyConnection(conn Connection)
 }
 
 // HealthThresholds defines the thresholds for connection health
 type HealthThresholds struct {
-	MaxLatency          time.Duration
-	MinBandwidth        int64
-	MaxPacketLoss       float64
-	MaxErrorRate        float64
-	MinHealthScore      float64
-	MaxIdleTime         time.Duration
-	HealthCheckInterval time.Duration
+	MaxLatency        time.Duration
+	MinBandwidth      int64
+	MaxPacketLoss     float64
+	MaxErrorRate      float64
+	MinScore          float64
+	MaxIdleTime       time.Duration
+	CheckInterval     time.Duration
 }
 
-// ConnectionPool manages a pool of connections with automatic healing
-type ConnectionPool interface {
-	// AddProvider registers a connection provider
-	AddProvider(provider ConnectionProvider) error
-
-	// RemoveProvider unregisters a connection provider
-	RemoveProvider(name string) error
-
-	// CreateConnection creates a new connection using the best available provider
-	CreateConnection(ctx context.Context, address string) (PluggableConnection, error)
-
+// ConnectionManager manages the lifecycle of connections
+type ConnectionManager interface {
+	// AddConnection adds a connection to be managed
+	AddConnection(conn Connection) error
+	
+	// RemoveConnection removes a connection from management
+	RemoveConnection(connID string) error
+	
+	// GetConnection returns a connection by ID
+	GetConnection(connID string) (Connection, bool)
+	
 	// GetHealthyConnections returns all healthy connections
-	GetHealthyConnections() []PluggableConnection
+	GetHealthyConnections() []Connection
+	
+	// GetAllConnections returns all connections
+	GetAllConnections() []Connection
+	
+	// SetAutoReconnect enables/disables automatic reconnection
+	SetAutoReconnect(enabled bool)
+}
 
-	// GetConnectionsByType returns connections of a specific type
-	GetConnectionsByType(connType string) []PluggableConnection
+// Session represents a multiplexing session
+type Session interface {
+	// OpenStream creates a new outbound stream
+	OpenStream() (Stream, error)
+	
+	// AcceptStream waits for and returns an incoming stream
+	AcceptStream() (Stream, error)
+	
+	// AddConnection adds a connection to the session
+	AddConnection(conn Connection) error
+	
+	// RemoveConnection removes a connection from the session
+	RemoveConnection(connID string) error
+	
+	// Close closes the session and all streams
+	Close() error
+	
+	// IsClosed returns true if the session is closed
+	IsClosed() bool
+	
+	// NumStreams returns the number of active streams
+	NumStreams() int
+	
+	// NumConnections returns the number of active connections
+	NumConnections() int
+}
 
-	// SetAutoHealing enables/disables automatic connection healing
-	SetAutoHealing(enabled bool)
-
-	// StartAutoHealing starts the auto-healing process
-	StartAutoHealing(ctx context.Context) error
+// Stream represents a logical stream within a session
+type Stream interface {
+	io.ReadWriteCloser
+	
+	// ID returns the stream ID
+	ID() uint32
+	
+	// Session returns the parent session
+	Session() Session
+	
+	// SetDeadline sets read and write deadlines
+	SetDeadline(t time.Time) error
+	
+	// SetReadDeadline sets the read deadline
+	SetReadDeadline(t time.Time) error
+	
+	// SetWriteDeadline sets the write deadline
+	SetWriteDeadline(t time.Time) error
 }
