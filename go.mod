@@ -1,4 +1,4 @@
-module github.com/yourusername/invmux
+module github.com/rtlvpn/invmux
 
 go 1.19
 
