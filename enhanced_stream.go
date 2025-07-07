@@ -13,7 +13,7 @@ import (
 type EnhancedStream struct {
 	id      uint32
 	session *EnhancedSession
-	
+
 	// Read related
 	readBuffer       []byte
 	readLock         sync.Mutex
@@ -22,27 +22,27 @@ type EnhancedStream struct {
 	readNotifyCh     chan struct{}
 	readShutdown     bool
 	outOfOrderChunks map[uint16][]byte
-	
+
 	// Write related
 	writeLock      sync.Mutex
 	nextWriteChunk uint16
 	writeDeadline  time.Time
 	writeShutdown  bool
 	writeBuffer    []byte
-	
+
 	// Enhanced features
-	priority       int
-	qosClass       string
-	metadata       map[string]interface{}
-	
+	priority int
+	qosClass string
+	metadata map[string]interface{}
+
 	// Metrics
-	bytesRead      int64
-	bytesWritten   int64
-	chunksRead     int64
-	chunksWritten  int64
-	created        time.Time
-	lastActivity   time.Time
-	
+	bytesRead     int64
+	bytesWritten  int64
+	chunksRead    int64
+	chunksWritten int64
+	created       time.Time
+	lastActivity  time.Time
+
 	// Shared
 	closeOnce sync.Once
 	closeCh   chan struct{}
@@ -123,7 +123,7 @@ func (s *EnhancedStream) GetMetadata(key string) (interface{}, bool) {
 func (s *EnhancedStream) GetMetrics() StreamMetrics {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	
+
 	return StreamMetrics{
 		StreamID:      s.id,
 		BytesRead:     atomic.LoadInt64(&s.bytesRead),
@@ -154,28 +154,28 @@ type StreamMetrics struct {
 func (s *EnhancedStream) Read(b []byte) (n int, err error) {
 	s.readLock.Lock()
 	defer s.readLock.Unlock()
-	
+
 	s.mu.RLock()
 	if s.closed {
 		s.mu.RUnlock()
 		return 0, io.EOF
 	}
 	s.mu.RUnlock()
-	
+
 	if len(s.readBuffer) == 0 {
 		if s.readShutdown {
 			return 0, io.EOF
 		}
-		
+
 		// Wait for data to arrive
 		s.readLock.Unlock()
-		
+
 		// Check for deadline
 		var timeout <-chan time.Time
 		if !s.readDeadline.IsZero() {
 			timeout = time.After(time.Until(s.readDeadline))
 		}
-		
+
 		select {
 		case <-s.readNotifyCh:
 		case <-s.closeCh:
@@ -188,9 +188,9 @@ func (s *EnhancedStream) Read(b []byte) (n int, err error) {
 			s.readLock.Lock()
 			return 0, s.session.ctx.Err()
 		}
-		
+
 		s.readLock.Lock()
-		
+
 		// Double check if we have data now
 		if len(s.readBuffer) == 0 {
 			if s.readShutdown {
@@ -199,17 +199,17 @@ func (s *EnhancedStream) Read(b []byte) (n int, err error) {
 			return 0, nil
 		}
 	}
-	
+
 	// Copy data to the target buffer
 	n = copy(b, s.readBuffer)
 	s.readBuffer = s.readBuffer[n:]
-	
+
 	// Update metrics
 	atomic.AddInt64(&s.bytesRead, int64(n))
 	s.mu.Lock()
 	s.lastActivity = time.Now()
 	s.mu.Unlock()
-	
+
 	return n, nil
 }
 
@@ -217,51 +217,51 @@ func (s *EnhancedStream) Read(b []byte) (n int, err error) {
 func (s *EnhancedStream) Write(b []byte) (n int, err error) {
 	s.writeLock.Lock()
 	defer s.writeLock.Unlock()
-	
+
 	s.mu.RLock()
 	if s.closed || s.writeShutdown {
 		s.mu.RUnlock()
 		return 0, ErrConnectionClosed
 	}
 	s.mu.RUnlock()
-	
+
 	// Check write deadline
 	if !s.writeDeadline.IsZero() && time.Now().After(s.writeDeadline) {
 		return 0, ErrTimeout
 	}
-	
+
 	total := len(b)
 	remaining := total
 	sent := 0
-	
+
 	for remaining > 0 {
 		// Determine chunk size based on connection capabilities
 		chunkSize := int(s.session.config.MaxChunkSize)
 		if remaining < chunkSize {
 			chunkSize = remaining
 		}
-		
+
 		// Send the chunk through the session
 		err = s.session.SendChunk(s.id, s.nextWriteChunk, b[sent:sent+chunkSize])
 		if err != nil {
 			return sent, err
 		}
-		
+
 		// Update counters
 		sent += chunkSize
 		remaining -= chunkSize
 		s.nextWriteChunk++
-		
+
 		// Update metrics
 		atomic.AddInt64(&s.chunksWritten, 1)
 	}
-	
+
 	// Update metrics
 	atomic.AddInt64(&s.bytesWritten, int64(total))
 	s.mu.Lock()
 	s.lastActivity = time.Now()
 	s.mu.Unlock()
-	
+
 	return total, nil
 }
 
@@ -269,15 +269,15 @@ func (s *EnhancedStream) Write(b []byte) (n int, err error) {
 func (s *EnhancedStream) receiveChunk(chunkID uint16, data []byte) {
 	s.readLock.Lock()
 	defer s.readLock.Unlock()
-	
+
 	// Update metrics
 	atomic.AddInt64(&s.chunksRead, 1)
-	
+
 	// Simple case: it's the next chunk we're expecting
 	if chunkID == s.nextReadChunk {
 		s.readBuffer = append(s.readBuffer, data...)
 		s.nextReadChunk++
-		
+
 		// Check if we have any buffered out-of-order chunks that can now be processed
 		if s.session.config.EnableOutOfOrderProcessing {
 			for {
@@ -285,7 +285,7 @@ func (s *EnhancedStream) receiveChunk(chunkID uint16, data []byte) {
 				if !exists {
 					break
 				}
-				
+
 				// Add the chunk to the read buffer
 				s.readBuffer = append(s.readBuffer, nextData...)
 				delete(s.outOfOrderChunks, s.nextReadChunk)
@@ -293,12 +293,12 @@ func (s *EnhancedStream) receiveChunk(chunkID uint16, data []byte) {
 				atomic.AddInt64(&s.chunksRead, 1)
 			}
 		}
-		
+
 		// Update activity
 		s.mu.Lock()
 		s.lastActivity = time.Now()
 		s.mu.Unlock()
-		
+
 		// Notify readers
 		select {
 		case s.readNotifyCh <- struct{}{}:
@@ -306,7 +306,7 @@ func (s *EnhancedStream) receiveChunk(chunkID uint16, data []byte) {
 		}
 		return
 	}
-	
+
 	// Handle out-of-order chunks if enabled
 	if s.session.config.EnableOutOfOrderProcessing {
 		// Check if the chunk is within our window
@@ -325,29 +325,29 @@ func (s *EnhancedStream) Close() error {
 		s.mu.Lock()
 		s.closed = true
 		s.mu.Unlock()
-		
+
 		close(s.closeCh)
-		
+
 		s.readLock.Lock()
 		s.readShutdown = true
 		s.readLock.Unlock()
-		
+
 		s.writeLock.Lock()
 		s.writeShutdown = true
 		s.writeLock.Unlock()
-		
+
 		// Notify middleware about stream closure
 		for _, middleware := range s.session.middleware {
 			if err := middleware.OnStreamClose(s.id); err != nil {
 				// Log error but don't prevent closure
 			}
 		}
-		
+
 		// Remove from session
 		s.session.streamLock.Lock()
 		delete(s.session.streams, s.id)
 		s.session.streamLock.Unlock()
-		
+
 		// Update metrics
 		atomic.AddInt64(&s.session.metrics.StreamsActive, -1)
 		atomic.AddInt64(&s.session.metrics.StreamsClosed, 1)

@@ -24,12 +24,12 @@ func NewDefaultConnectionPool() *DefaultConnectionPool {
 	pool := &DefaultConnectionPool{
 		providers: make(map[string]ConnectionProvider),
 	}
-	
+
 	// Register default providers
 	pool.AddProvider(NewTCPProvider(10 * time.Second))
 	pool.AddProvider(NewUDPProvider(5 * time.Second))
-	pool.AddProvider(NewDNSTunnelProvider("8.8.8.8:53", "tunnel.example.com", 30 * time.Second))
-	
+	pool.AddProvider(NewDNSTunnelProvider("8.8.8.8:53", "tunnel.example.com", 30*time.Second))
+
 	return pool
 }
 
@@ -50,7 +50,7 @@ func (p *DefaultConnectionPool) RemoveProvider(name string) error {
 func (p *DefaultConnectionPool) CreateConnection(ctx context.Context, address string) (PluggableConnection, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	
+
 	// Find a provider that supports this address
 	var supportingProviders []ConnectionProvider
 	for _, provider := range p.providers {
@@ -58,11 +58,11 @@ func (p *DefaultConnectionPool) CreateConnection(ctx context.Context, address st
 			supportingProviders = append(supportingProviders, provider)
 		}
 	}
-	
+
 	if len(supportingProviders) == 0 {
 		return nil, fmt.Errorf("no provider supports address: %s", address)
 	}
-	
+
 	// Try providers in order (could be improved with better selection logic)
 	var lastErr error
 	for _, provider := range supportingProviders {
@@ -72,7 +72,7 @@ func (p *DefaultConnectionPool) CreateConnection(ctx context.Context, address st
 		}
 		lastErr = err
 	}
-	
+
 	return nil, fmt.Errorf("all providers failed, last error: %w", lastErr)
 }
 
@@ -98,7 +98,7 @@ func (p *DefaultConnectionPool) StartAutoHealing(ctx context.Context) error {
 	// Simple auto-healing implementation
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -118,7 +118,7 @@ func (p *DefaultConnectionPool) performHealthChecks(ctx context.Context) {
 		providers = append(providers, provider)
 	}
 	p.mu.RUnlock()
-	
+
 	for _, provider := range providers {
 		go func(p ConnectionProvider) {
 			if err := p.HealthCheck(ctx); err != nil {
@@ -150,14 +150,14 @@ func (b *RoundRobinBalancer) SelectConnection(connections []PluggableConnection,
 	if len(connections) == 0 {
 		return nil, errors.New("no connections available")
 	}
-	
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	
+
 	// Simple round-robin
 	selectedIndex := b.index % int64(len(connections))
 	b.index++
-	
+
 	return connections[selectedIndex], nil
 }
 
@@ -196,14 +196,14 @@ func (b *LatencyBasedBalancer) SelectConnection(connections []PluggableConnectio
 	if len(connections) == 0 {
 		return nil, errors.New("no connections available")
 	}
-	
+
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	
+
 	// Find connection with lowest latency
 	var bestConn PluggableConnection
 	var bestLatency time.Duration = time.Hour // Start with a very high value
-	
+
 	for _, conn := range connections {
 		quality := conn.Quality()
 		if quality.Latency < bestLatency && quality.IsHealthy {
@@ -211,7 +211,7 @@ func (b *LatencyBasedBalancer) SelectConnection(connections []PluggableConnectio
 			bestConn = conn
 		}
 	}
-	
+
 	if bestConn == nil {
 		// Fall back to first healthy connection
 		for _, conn := range connections {
@@ -222,7 +222,7 @@ func (b *LatencyBasedBalancer) SelectConnection(connections []PluggableConnectio
 		// If no healthy connections, use the first one
 		return connections[0], nil
 	}
-	
+
 	return bestConn, nil
 }
 
@@ -266,10 +266,10 @@ func (b *WeightedBalancer) SelectConnection(connections []PluggableConnection, d
 	if len(connections) == 0 {
 		return nil, errors.New("no connections available")
 	}
-	
+
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	
+
 	// Calculate total weight
 	totalWeight := 0
 	for _, conn := range connections {
@@ -279,16 +279,16 @@ func (b *WeightedBalancer) SelectConnection(connections []PluggableConnection, d
 		}
 		totalWeight += weight
 	}
-	
+
 	if totalWeight == 0 {
 		// Fall back to first connection
 		return connections[0], nil
 	}
-	
+
 	// Select based on weighted random
 	target := rand.Intn(totalWeight)
 	current := 0
-	
+
 	for _, conn := range connections {
 		weight := b.weights[conn.Metadata().RemoteAddress]
 		if weight <= 0 {
@@ -299,7 +299,7 @@ func (b *WeightedBalancer) SelectConnection(connections []PluggableConnection, d
 			return conn, nil
 		}
 	}
-	
+
 	// Should never reach here, but fall back to first connection
 	return connections[0], nil
 }
@@ -342,7 +342,7 @@ func (h *DefaultErrorHandler) HandleConnectionError(conn PluggableConnection, er
 	if err == nil {
 		return ErrorActionIgnore
 	}
-	
+
 	// Check error type and decide action
 	if netErr, ok := err.(net.Error); ok {
 		if netErr.Timeout() {
@@ -352,7 +352,7 @@ func (h *DefaultErrorHandler) HandleConnectionError(conn PluggableConnection, er
 			return ErrorActionRetry
 		}
 	}
-	
+
 	// Check for common network errors
 	errStr := err.Error()
 	if strings.Contains(errStr, "connection refused") ||
@@ -360,12 +360,12 @@ func (h *DefaultErrorHandler) HandleConnectionError(conn PluggableConnection, er
 		strings.Contains(errStr, "network unreachable") {
 		return ErrorActionReconnect
 	}
-	
+
 	if strings.Contains(errStr, "broken pipe") ||
 		strings.Contains(errStr, "connection reset") {
 		return ErrorActionRemoveConnection
 	}
-	
+
 	// Default to retry for unknown errors
 	return ErrorActionRetry
 }
@@ -374,7 +374,7 @@ func (h *DefaultErrorHandler) HandleSessionError(session *EnhancedSession, err e
 	if err == nil {
 		return ErrorActionIgnore
 	}
-	
+
 	// For session-level errors, usually we want to continue
 	return ErrorActionIgnore
 }
@@ -383,7 +383,7 @@ func (h *DefaultErrorHandler) HandleStreamError(stream *EnhancedStream, err erro
 	if err == nil {
 		return ErrorActionIgnore
 	}
-	
+
 	// For stream errors, usually ignore and let the stream handle it
 	return ErrorActionIgnore
 }
@@ -406,11 +406,11 @@ func NewDefaultHealthMonitor() *DefaultHealthMonitor {
 func (m *DefaultHealthMonitor) StartMonitoring(session *EnhancedSession) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	if m.running {
 		return errors.New("health monitoring already running")
 	}
-	
+
 	m.running = true
 	go m.monitorLoop(session)
 	return nil
@@ -419,11 +419,11 @@ func (m *DefaultHealthMonitor) StartMonitoring(session *EnhancedSession) error {
 func (m *DefaultHealthMonitor) StopMonitoring() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	if !m.running {
 		return nil
 	}
-	
+
 	m.running = false
 	close(m.stopCh)
 	m.stopCh = make(chan struct{}) // Reset for potential restart
@@ -432,39 +432,39 @@ func (m *DefaultHealthMonitor) StopMonitoring() error {
 
 func (m *DefaultHealthMonitor) CheckConnection(conn PluggableConnection) ConnectionQuality {
 	quality := conn.Quality()
-	
+
 	// Update health status based on thresholds
 	quality.IsHealthy = true
-	
+
 	if quality.Latency > m.thresholds.MaxLatency {
 		quality.IsHealthy = false
 		quality.HealthScore *= 0.5 // Reduce health score
 	}
-	
+
 	if quality.UploadBandwidth+quality.DownloadBandwidth < m.thresholds.MinBandwidth {
 		quality.IsHealthy = false
 		quality.HealthScore *= 0.7
 	}
-	
+
 	if quality.PacketLoss > m.thresholds.MaxPacketLoss {
 		quality.IsHealthy = false
 		quality.HealthScore *= 0.6
 	}
-	
+
 	if quality.ErrorRate > m.thresholds.MaxErrorRate {
 		quality.IsHealthy = false
 		quality.HealthScore *= 0.4
 	}
-	
+
 	if time.Since(quality.LastActivity) > m.thresholds.MaxIdleTime {
 		quality.IsHealthy = false
 		quality.HealthScore *= 0.3
 	}
-	
+
 	if quality.HealthScore < m.thresholds.MinHealthScore {
 		quality.IsHealthy = false
 	}
-	
+
 	return quality
 }
 
@@ -477,7 +477,7 @@ func (m *DefaultHealthMonitor) SetHealthThresholds(thresholds HealthThresholds) 
 func (m *DefaultHealthMonitor) monitorLoop(session *EnhancedSession) {
 	ticker := time.NewTicker(m.thresholds.HealthCheckInterval)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-ticker.C:
@@ -492,18 +492,18 @@ func (m *DefaultHealthMonitor) monitorLoop(session *EnhancedSession) {
 
 func (m *DefaultHealthMonitor) performHealthChecks(session *EnhancedSession) {
 	connections := session.GetConnections()
-	
+
 	for _, conn := range connections {
 		quality := m.CheckConnection(conn)
-		
+
 		// Update balancer with new stats
 		if session.balancer != nil {
 			session.balancer.UpdateStats(conn.Metadata().RemoteAddress, quality)
 		}
-		
+
 		// Log unhealthy connections
 		if !quality.IsHealthy {
-			log.Printf("Connection %s is unhealthy (score: %.2f)", 
+			log.Printf("Connection %s is unhealthy (score: %.2f)",
 				conn.Metadata().RemoteAddress, quality.HealthScore)
 		}
 	}
@@ -530,7 +530,7 @@ func (m *CompressionMiddleware) ProcessWrite(streamID uint32, data []byte) ([]by
 	if len(data) < 100 {
 		return data, nil // Don't compress small data
 	}
-	
+
 	// Simulate compression by adding a header
 	compressed := make([]byte, len(data)+4)
 	compressed[0] = 0xC0 // Compression marker
@@ -538,7 +538,7 @@ func (m *CompressionMiddleware) ProcessWrite(streamID uint32, data []byte) ([]by
 	compressed[2] = byte(len(data) >> 8)
 	compressed[3] = byte(len(data))
 	copy(compressed[4:], data)
-	
+
 	return compressed, nil
 }
 
@@ -547,14 +547,14 @@ func (m *CompressionMiddleware) ProcessRead(streamID uint32, data []byte) ([]byt
 	if len(data) < 4 || data[0] != 0xC0 {
 		return data, nil // Not compressed
 	}
-	
+
 	// Extract original data
 	originalSize := int(data[2])<<8 | int(data[3])
 	if len(data) < 4+originalSize {
 		return nil, errors.New("invalid compressed data")
 	}
-	
-	return data[4:4+originalSize], nil
+
+	return data[4 : 4+originalSize], nil
 }
 
 func (m *CompressionMiddleware) OnStreamOpen(streamID uint32) error {

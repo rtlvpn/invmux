@@ -31,31 +31,31 @@ func main() {
 			OutOfOrderWindowSize:       512,
 			DistributionPolicy:         invmux.RoundRobin,
 		},
-		
+
 		// Enhanced features
-		AutoHealing:              true,
-		AutoReconnect:            true,
-		ConnectionRedundancy:     2,
-		MaxReconnectAttempts:     3,
-		ReconnectBackoffInitial:  1 * time.Second,
+		AutoHealing:                true,
+		AutoReconnect:              true,
+		ConnectionRedundancy:       2,
+		MaxReconnectAttempts:       3,
+		ReconnectBackoffInitial:    1 * time.Second,
 		ReconnectBackoffMultiplier: 2.0,
-		ReconnectBackoffMax:      30 * time.Second,
-		PreferReliableConnections: true,
-		UseAdaptiveDistribution:  true,
-		DistributionHistorySize:  1000,
-		
+		ReconnectBackoffMax:        30 * time.Second,
+		PreferReliableConnections:  true,
+		UseAdaptiveDistribution:    true,
+		DistributionHistorySize:    1000,
+
 		// Custom components
 		ConnectionPool:     invmux.NewDefaultConnectionPool(),
 		ConnectionBalancer: invmux.NewLatencyBasedBalancer(),
 		ErrorHandler:       invmux.NewDefaultErrorHandler(),
 		HealthMonitor:      invmux.NewDefaultHealthMonitor(),
-		
+
 		// Middleware stack
 		Middleware: []invmux.StreamMiddleware{
 			invmux.NewCompressionMiddleware(),
 			invmux.NewEncryptionMiddleware([]byte("secret-key-1234")),
 		},
-		
+
 		// Health thresholds
 		HealthThresholds: invmux.HealthThresholds{
 			MaxLatency:          200 * time.Millisecond,
@@ -100,17 +100,17 @@ func main() {
 
 func setupConnectionProviders(config *invmux.EnhancedConfig) {
 	fmt.Println("Registering connection providers...")
-	
+
 	// Add additional providers to the connection pool
 	tcpProvider := invmux.NewTCPProvider(10 * time.Second)
 	udpProvider := invmux.NewUDPProvider(5 * time.Second)
-	dnsProvider := invmux.NewDNSTunnelProvider("8.8.8.8:53", "tunnel.example.com", 30 * time.Second)
-	
+	dnsProvider := invmux.NewDNSTunnelProvider("8.8.8.8:53", "tunnel.example.com", 30*time.Second)
+
 	config.ConnectionPool.AddProvider(tcpProvider)
 	config.ConnectionPool.AddProvider(udpProvider)
 	config.ConnectionPool.AddProvider(dnsProvider)
-	
-	fmt.Printf("Registered providers: %s, %s, %s\n", 
+
+	fmt.Printf("Registered providers: %s, %s, %s\n",
 		tcpProvider.Name(), udpProvider.Name(), dnsProvider.Name())
 }
 
@@ -175,17 +175,17 @@ type mockPluggableConnection struct {
 	quality  invmux.ConnectionQuality
 }
 
-func (c *mockPluggableConnection) Provider() invmux.ConnectionProvider     { return c.provider }
-func (c *mockPluggableConnection) Metadata() invmux.ConnectionMetadata     { return c.metadata }
-func (c *mockPluggableConnection) Quality() invmux.ConnectionQuality       { return c.quality }
-func (c *mockPluggableConnection) Priority() int                           { return c.priority }
-func (c *mockPluggableConnection) SetPriority(priority int)                { c.priority = priority }
-func (c *mockPluggableConnection) IsReliable() bool                        { return c.connType == "tcp" }
-func (c *mockPluggableConnection) MaxMTU() int                             { return 1500 }
+func (c *mockPluggableConnection) Provider() invmux.ConnectionProvider { return c.provider }
+func (c *mockPluggableConnection) Metadata() invmux.ConnectionMetadata { return c.metadata }
+func (c *mockPluggableConnection) Quality() invmux.ConnectionQuality   { return c.quality }
+func (c *mockPluggableConnection) Priority() int                       { return c.priority }
+func (c *mockPluggableConnection) SetPriority(priority int)            { c.priority = priority }
+func (c *mockPluggableConnection) IsReliable() bool                    { return c.connType == "tcp" }
+func (c *mockPluggableConnection) MaxMTU() int                         { return 1500 }
 
 func runServer(session *invmux.EnhancedSession) {
 	fmt.Println("Server started, waiting for connections...")
-	
+
 	for {
 		stream, err := session.AcceptStream()
 		if err != nil {
@@ -200,11 +200,11 @@ func runServer(session *invmux.EnhancedSession) {
 
 func handleServerStream(stream *invmux.EnhancedStream) {
 	defer stream.Close()
-	
+
 	// Set QoS and metadata
 	stream.SetQoSClass("high-priority")
 	stream.SetMetadata("handler", "echo-server")
-	
+
 	buf := make([]byte, 4096)
 	for {
 		n, err := stream.Read(buf)
@@ -223,7 +223,7 @@ func handleServerStream(stream *invmux.EnhancedStream) {
 			break
 		}
 	}
-	
+
 	// Print stream metrics
 	metrics := stream.GetMetrics()
 	fmt.Printf("Stream %d metrics - Read: %d bytes, Written: %d bytes, Priority: %d, QoS: %s\n",
@@ -232,23 +232,23 @@ func handleServerStream(stream *invmux.EnhancedStream) {
 
 func demonstrateFeatures(session *invmux.EnhancedSession) {
 	fmt.Println("\n=== Demonstrating Enhanced Features ===")
-	
+
 	// 1. Multiple streams with different priorities
 	demonstrateStreamPriorities(session)
-	
+
 	// 2. Middleware effects
 	demonstrateMiddleware(session)
-	
+
 	// 3. Connection management
 	demonstrateConnectionManagement(session)
-	
+
 	// 4. Metrics and monitoring
 	demonstrateMetrics(session)
 }
 
 func demonstrateStreamPriorities(session *invmux.EnhancedSession) {
 	fmt.Println("\n--- Stream Priorities ---")
-	
+
 	// Create streams with different priorities
 	priorities := []int{10, 50, 100}
 	for i, priority := range priorities {
@@ -257,43 +257,43 @@ func demonstrateStreamPriorities(session *invmux.EnhancedSession) {
 			log.Printf("Failed to open stream: %v", err)
 			continue
 		}
-		
+
 		stream.SetPriority(priority)
 		stream.SetQoSClass(fmt.Sprintf("priority-%d", priority))
 		stream.SetMetadata("test", fmt.Sprintf("priority-test-%d", i))
-		
+
 		// Send test data
 		message := fmt.Sprintf("Priority %d message from stream %d", priority, stream.StreamID())
 		stream.Write([]byte(message))
-		
+
 		// Read response
 		response := make([]byte, 1024)
 		n, _ := stream.Read(response)
 		fmt.Printf("Stream %d (priority %d): %s\n", stream.StreamID(), priority, response[:n])
-		
+
 		stream.Close()
 	}
 }
 
 func demonstrateMiddleware(session *invmux.EnhancedSession) {
 	fmt.Println("\n--- Middleware Effects ---")
-	
+
 	stream, err := session.OpenStream()
 	if err != nil {
 		log.Printf("Failed to open stream: %v", err)
 		return
 	}
 	defer stream.Close()
-	
+
 	// Send data that will be processed by compression and encryption middleware
 	largeMessage := make([]byte, 1000)
 	for i := range largeMessage {
 		largeMessage[i] = byte('A' + (i % 26))
 	}
-	
+
 	fmt.Printf("Sending %d bytes through middleware stack...\n", len(largeMessage))
 	stream.Write(largeMessage)
-	
+
 	// Read response
 	response := make([]byte, 2048)
 	n, _ := stream.Read(response)
@@ -302,10 +302,10 @@ func demonstrateMiddleware(session *invmux.EnhancedSession) {
 
 func demonstrateConnectionManagement(session *invmux.EnhancedSession) {
 	fmt.Println("\n--- Connection Management ---")
-	
+
 	connections := session.GetConnections()
 	fmt.Printf("Active connections: %d\n", len(connections))
-	
+
 	for i, conn := range connections {
 		metadata := conn.Metadata()
 		quality := conn.Quality()
@@ -316,9 +316,9 @@ func demonstrateConnectionManagement(session *invmux.EnhancedSession) {
 
 func demonstrateMetrics(session *invmux.EnhancedSession) {
 	fmt.Println("\n--- Session Metrics ---")
-	
+
 	metrics := session.GetMetrics()
-	fmt.Printf("Connections Active: %d, Total: %d\n", 
+	fmt.Printf("Connections Active: %d, Total: %d\n",
 		metrics.ConnectionsActive, metrics.ConnectionsTotal)
 	fmt.Printf("Streams Active: %d, Total: %d, Closed: %d\n",
 		metrics.StreamsActive, metrics.StreamsTotal, metrics.StreamsClosed)
@@ -333,24 +333,24 @@ func demonstrateMetrics(session *invmux.EnhancedSession) {
 // demonstrateRealWorldUsage shows how to use the library in real-world scenarios
 func demonstrateRealWorldUsage() {
 	fmt.Println("\n=== Real-World Usage Examples ===")
-	
+
 	// Example 1: DNS Tunneling
 	demonstrateDNSTunneling()
-	
+
 	// Example 2: Multi-path networking
 	demonstrateMultiPath()
-	
+
 	// Example 3: Custom middleware
 	demonstrateCustomMiddleware()
 }
 
 func demonstrateDNSTunneling() {
 	fmt.Println("\n--- DNS Tunneling Example ---")
-	
+
 	config := invmux.DefaultEnhancedConfig()
 	session := invmux.NewEnhancedSession(config)
 	defer session.Close()
-	
+
 	// Add DNS tunnel connection
 	err := session.AddConnectionByAddress("dns://tunnel.example.com@8.8.8.8:53")
 	if err != nil {
@@ -358,7 +358,7 @@ func demonstrateDNSTunneling() {
 	} else {
 		fmt.Println("DNS tunnel connection established successfully!")
 	}
-	
+
 	// DNS tunneling would work with real DNS infrastructure
 	fmt.Println("DNS tunneling provides steganographic communication through DNS queries")
 	fmt.Println("Useful for bypassing firewalls and censorship")
@@ -366,18 +366,18 @@ func demonstrateDNSTunneling() {
 
 func demonstrateMultiPath() {
 	fmt.Println("\n--- Multi-Path Networking Example ---")
-	
+
 	config := invmux.DefaultEnhancedConfig()
 	config.ConnectionBalancer = invmux.NewLatencyBasedBalancer()
 	session := invmux.NewEnhancedSession(config)
 	defer session.Close()
-	
+
 	// In real usage, you'd add multiple actual network paths:
 	// session.AddConnectionByAddress("tcp://server1.example.com:8080")
-	// session.AddConnectionByAddress("tcp://server2.example.com:8080") 
+	// session.AddConnectionByAddress("tcp://server2.example.com:8080")
 	// session.AddConnectionByAddress("udp://server3.example.com:8080")
 	// session.AddConnectionByAddress("dns://tunnel.example.com@8.8.8.8")
-	
+
 	fmt.Println("Multi-path networking allows:")
 	fmt.Println("- Increased bandwidth by bonding multiple connections")
 	fmt.Println("- Redundancy and failover capability")
@@ -386,16 +386,16 @@ func demonstrateMultiPath() {
 
 func demonstrateCustomMiddleware() {
 	fmt.Println("\n--- Custom Middleware Example ---")
-	
+
 	// Example of a custom middleware that logs all traffic
 	loggingMiddleware := &LoggingMiddleware{name: "traffic-logger"}
-	
+
 	config := invmux.DefaultEnhancedConfig()
 	config.Middleware = append(config.Middleware, loggingMiddleware)
-	
+
 	session := invmux.NewEnhancedSession(config)
 	defer session.Close()
-	
+
 	fmt.Println("Custom middleware can provide:")
 	fmt.Println("- Traffic logging and analytics")
 	fmt.Println("- Custom encryption/compression algorithms")

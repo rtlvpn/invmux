@@ -37,13 +37,13 @@ func (p *TCPProvider) SupportsAddress(address string) bool {
 
 func (p *TCPProvider) Dial(ctx context.Context, address string) (PluggableConnection, error) {
 	address = strings.TrimPrefix(address, "tcp://")
-	
+
 	dialer := &net.Dialer{Timeout: p.timeout}
 	conn, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	return &StandardConnection{
 		Conn:     conn,
 		provider: p,
@@ -57,24 +57,24 @@ func (p *TCPProvider) Dial(ctx context.Context, address string) (PluggableConnec
 			Created:       time.Now(),
 		},
 		quality: ConnectionQuality{
-			IsHealthy:   true,
-			HealthScore: 1.0,
-			LastActivity: time.Now(),
+			IsHealthy:     true,
+			HealthScore:   1.0,
+			LastActivity:  time.Now(),
 			CustomMetrics: make(map[string]float64),
 		},
-		priority: 100, // High priority for reliable connections
+		priority: 100,  // High priority for reliable connections
 		mtu:      1500, // Standard Ethernet MTU
 	}, nil
 }
 
 func (p *TCPProvider) Listen(ctx context.Context, address string) (ConnectionListener, error) {
 	address = strings.TrimPrefix(address, "tcp://")
-	
+
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	return &StandardListener{
 		Listener: listener,
 		provider: p,
@@ -110,12 +110,12 @@ func (p *UDPProvider) SupportsAddress(address string) bool {
 
 func (p *UDPProvider) Dial(ctx context.Context, address string) (PluggableConnection, error) {
 	address = strings.TrimPrefix(address, "udp://")
-	
+
 	conn, err := net.DialTimeout("udp", address, p.timeout)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	return &StandardConnection{
 		Conn:     conn,
 		provider: p,
@@ -134,24 +134,24 @@ func (p *UDPProvider) Dial(ctx context.Context, address string) (PluggableConnec
 			LastActivity:  time.Now(),
 			CustomMetrics: make(map[string]float64),
 		},
-		priority: 80, // Lower priority than TCP
+		priority: 80,   // Lower priority than TCP
 		mtu:      1472, // UDP payload size for standard Ethernet
 	}, nil
 }
 
 func (p *UDPProvider) Listen(ctx context.Context, address string) (ConnectionListener, error) {
 	address = strings.TrimPrefix(address, "udp://")
-	
+
 	addr, err := net.ResolveUDPAddr("udp", address)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	listener, err := net.ListenUDP("udp", addr)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	return &UDPListener{
 		PacketConn: listener,
 		provider:   p,
@@ -197,23 +197,23 @@ func (p *DNSTunnelProvider) Dial(ctx context.Context, address string) (Pluggable
 	// Parse DNS tunnel address: dns://domain@nameserver or dnstt://domain@nameserver
 	address = strings.TrimPrefix(address, "dns://")
 	address = strings.TrimPrefix(address, "dnstt://")
-	
+
 	parts := strings.Split(address, "@")
 	domain := parts[0]
 	nameserver := p.dnsServer
 	if len(parts) > 1 {
 		nameserver = parts[1]
 	}
-	
+
 	conn := &DNSTunnelConnection{
-		provider:    p,
-		domain:      domain,
-		nameserver:  nameserver,
-		timeout:     p.timeout,
-		maxPayload:  p.maxPayload,
-		sendQueue:   make(chan []byte, 1000),
-		recvQueue:   make(chan []byte, 1000),
-		closeCh:     make(chan struct{}),
+		provider:   p,
+		domain:     domain,
+		nameserver: nameserver,
+		timeout:    p.timeout,
+		maxPayload: p.maxPayload,
+		sendQueue:  make(chan []byte, 1000),
+		recvQueue:  make(chan []byte, 1000),
+		closeCh:    make(chan struct{}),
 		metadata: ConnectionMetadata{
 			Type:          "dns-tunnel",
 			Protocol:      "dns-over-udp",
@@ -235,12 +235,12 @@ func (p *DNSTunnelProvider) Dial(ctx context.Context, address string) (Pluggable
 		},
 		priority: 40, // Lower priority due to overhead
 	}
-	
+
 	// Start the DNS tunnel goroutines
 	if err := conn.start(ctx); err != nil {
 		return nil, err
 	}
-	
+
 	return conn, nil
 }
 
@@ -334,7 +334,7 @@ func (l *StandardListener) Accept() (PluggableConnection, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	return &StandardConnection{
 		Conn:     conn,
 		provider: l.provider,
@@ -372,13 +372,13 @@ type UDPConnection struct {
 	remoteAddr net.Addr
 }
 
-func (c *UDPConnection) Provider() ConnectionProvider     { return c.provider }
-func (c *UDPConnection) Metadata() ConnectionMetadata     { return c.metadata }
-func (c *UDPConnection) Quality() ConnectionQuality       { return c.quality }
-func (c *UDPConnection) Priority() int                    { return c.priority }
-func (c *UDPConnection) SetPriority(priority int)         { c.priority = priority }
-func (c *UDPConnection) IsReliable() bool                 { return false }
-func (c *UDPConnection) MaxMTU() int                      { return 1472 }
+func (c *UDPConnection) Provider() ConnectionProvider { return c.provider }
+func (c *UDPConnection) Metadata() ConnectionMetadata { return c.metadata }
+func (c *UDPConnection) Quality() ConnectionQuality   { return c.quality }
+func (c *UDPConnection) Priority() int                { return c.priority }
+func (c *UDPConnection) SetPriority(priority int)     { c.priority = priority }
+func (c *UDPConnection) IsReliable() bool             { return false }
+func (c *UDPConnection) MaxMTU() int                  { return 1472 }
 
 // UDPListener handles UDP "connections"
 type UDPListener struct {
@@ -406,28 +406,28 @@ func (l *UDPListener) Addr() net.Addr {
 
 // DNSTunnelConnection implements DNS tunneling
 type DNSTunnelConnection struct {
-	provider    *DNSTunnelProvider
-	domain      string
-	nameserver  string
-	timeout     time.Duration
-	maxPayload  int
-	sendQueue   chan []byte
-	recvQueue   chan []byte
-	closeCh     chan struct{}
-	closed      bool
-	metadata    ConnectionMetadata
-	quality     ConnectionQuality
-	priority    int
-	mu          sync.RWMutex
+	provider   *DNSTunnelProvider
+	domain     string
+	nameserver string
+	timeout    time.Duration
+	maxPayload int
+	sendQueue  chan []byte
+	recvQueue  chan []byte
+	closeCh    chan struct{}
+	closed     bool
+	metadata   ConnectionMetadata
+	quality    ConnectionQuality
+	priority   int
+	mu         sync.RWMutex
 }
 
 func (c *DNSTunnelConnection) start(ctx context.Context) error {
 	// Start sender goroutine
 	go c.senderLoop(ctx)
-	
+
 	// Start receiver goroutine (simplified - in real implementation would listen for DNS responses)
 	go c.receiverLoop(ctx)
-	
+
 	return nil
 }
 
@@ -463,20 +463,20 @@ func (c *DNSTunnelConnection) receiverLoop(ctx context.Context) {
 func (c *DNSTunnelConnection) sendDNSQuery(data []byte) error {
 	// Encode data as base64 for DNS-safe transmission
 	encoded := base64.StdEncoding.EncodeToString(data)
-	
+
 	// Split into chunks that fit in DNS labels (max 63 chars per label)
 	chunks := c.chunkString(encoded, 60)
-	
+
 	// Create DNS query
 	query := strings.Join(chunks, ".") + "." + c.domain
-	
+
 	// Send DNS TXT query (simplified - in real implementation use proper DNS library)
 	_, err := net.LookupTXT(query)
-	
+
 	c.mu.Lock()
 	c.quality.LastActivity = time.Now()
 	c.mu.Unlock()
-	
+
 	return err
 }
 
@@ -499,7 +499,7 @@ func (c *DNSTunnelConnection) Read(b []byte) (n int, err error) {
 		return 0, errors.New("connection closed")
 	}
 	c.mu.RUnlock()
-	
+
 	select {
 	case data := <-c.recvQueue:
 		n = copy(b, data)
@@ -519,33 +519,33 @@ func (c *DNSTunnelConnection) Write(b []byte) (n int, err error) {
 		return 0, errors.New("connection closed")
 	}
 	c.mu.RUnlock()
-	
+
 	// Split data into chunks that fit in DNS queries
 	for i := 0; i < len(b); i += c.maxPayload {
 		end := i + c.maxPayload
 		if end > len(b) {
 			end = len(b)
 		}
-		
+
 		chunk := make([]byte, end-i)
 		copy(chunk, b[i:end])
-		
+
 		select {
 		case c.sendQueue <- chunk:
 		case <-c.closeCh:
 			return n, errors.New("connection closed")
 		}
-		
+
 		n += len(chunk)
 	}
-	
+
 	return n, nil
 }
 
 func (c *DNSTunnelConnection) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	if !c.closed {
 		c.closed = true
 		close(c.closeCh)
