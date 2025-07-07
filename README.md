@@ -1,148 +1,481 @@
-# InvMux - Inverse Connection Multiplexer for Go
+# Enhanced InvMux - Advanced Inverse Connection Multiplexer for Go
 
-InvMux is a Go library that implements inverse multiplexing for network connections. While traditional multiplexers like [smux](https://github.com/xtaci/smux) allow multiple logical connections over a single physical connection, InvMux does the opposite - it splits a single logical connection across multiple physical connections.
+InvMux is a powerful, production-ready Go library that implements inverse multiplexing for network connections with pluggable interfaces and advanced features. While traditional multiplexers like [smux](https://github.com/xtaci/smux) allow multiple logical connections over a single physical connection, InvMux does the opposite - it intelligently distributes a single logical connection across multiple physical connections of any type.
 
-## Features
+## 🚀 Key Features
 
-- Split a single logical connection across multiple physical connections
-- Automatic chunking and reassembly of data packets
-- Bidirectional communication
-- Stream-oriented API similar to net.Conn
-- Multiple distribution policies (round-robin, lowest latency, highest bandwidth, weighted)
-- Out-of-order packet handling and reassembly
-- Configurable buffer sizes and window sizes
-- Connection statistics and monitoring
-- Easily add or remove physical connections at runtime
+### Core Capabilities
+- **Inverse Multiplexing**: Split logical connections across multiple physical connections
+- **Pluggable Connection Providers**: Support for TCP, UDP, DNS tunneling, HTTP, and custom protocols
+- **Advanced Load Balancing**: Multiple distribution strategies with intelligent routing
+- **Stream Middleware**: Extensible middleware system for compression, encryption, and custom processing
+- **Health Monitoring**: Automatic connection health monitoring and failover
+- **Comprehensive Metrics**: Detailed performance and usage statistics
 
-## Usage
+### Connection Types Supported
+- **TCP/TLS**: Reliable, high-performance connections
+- **UDP**: Fast, low-latency connections for real-time applications  
+- **DNS Tunneling**: Steganographic communication through DNS queries (firewall/censorship resistant)
+- **HTTP/WebSocket**: Web-compatible connections
+- **Custom Protocols**: Easy to implement custom connection providers
 
-### Basic Usage
+### Advanced Features
+- **Auto-Healing**: Automatic connection recovery and reconnection
+- **Quality of Service**: Stream prioritization and QoS classes
+- **Out-of-Order Processing**: Handle packets arriving out of sequence
+- **Connection Bonding**: Aggregate bandwidth from multiple connections
+- **Intelligent Failover**: Seamless switching when connections fail
+- **Pluggable Architecture**: Every component is replaceable/customizable
+
+## 📦 Installation
+
+```bash
+go get github.com/yourusername/invmux
+```
+
+## 🏁 Quick Start
+
+### Basic Usage with Enhanced Features
 
 ```go
-// Create sessions on both ends
-clientSession := invmux.NewSession(nil) // nil uses default config
-serverSession := invmux.NewSession(nil)
+package main
 
-// Add physical connections to both sessions
-// In a real application, these would be connections between two separate machines
-clientSession.AddPhysicalConnection(conn1)
-clientSession.AddPhysicalConnection(conn2)
-serverSession.AddPhysicalConnection(conn1Remote)
-serverSession.AddPhysicalConnection(conn2Remote)
+import (
+    "fmt"
+    "time"
+    "github.com/yourusername/invmux"
+)
 
-// Server side: Accept streams
-go func() {
-    stream, err := serverSession.AcceptStream()
-    if err != nil {
-        // Handle error
+func main() {
+    // Create enhanced configuration
+    config := invmux.DefaultEnhancedConfig()
+    config.AutoHealing = true
+    config.ConnectionBalancer = invmux.NewLatencyBasedBalancer()
+    
+    // Add middleware for compression and encryption
+    config.Middleware = []invmux.StreamMiddleware{
+        invmux.NewCompressionMiddleware(),
+        invmux.NewEncryptionMiddleware([]byte("secret-key-1234")),
     }
     
-    // Use stream like a regular net.Conn
-    io.Copy(os.Stdout, stream)
-    stream.Close()
-}()
+    // Create session
+    session := invmux.NewEnhancedSession(config)
+    defer session.Close()
+    
+    // Add multiple connection types
+    session.AddConnectionByAddress("tcp://server1.example.com:8080")
+    session.AddConnectionByAddress("udp://server2.example.com:8080") 
+    session.AddConnectionByAddress("dns://tunnel.example.com@8.8.8.8")
+    
+    // Open a stream and use it like a regular net.Conn
+    stream, err := session.OpenStream()
+    if err != nil {
+        panic(err)
+    }
+    defer stream.Close()
+    
+    // Set QoS and priority
+    stream.SetPriority(100)
+    stream.SetQoSClass("high-priority")
+    
+    // Use the stream
+    stream.Write([]byte("Hello, distributed world!"))
+    
+    response := make([]byte, 1024)
+    n, _ := stream.Read(response)
+    fmt.Printf("Response: %s\n", response[:n])
+    
+    // Get detailed metrics
+    metrics := session.GetMetrics()
+    fmt.Printf("Total data sent: %d bytes\n", metrics.BytesSent)
+}
+```
 
-// Client side: Open a stream
-clientStream, err := clientSession.OpenStream()
+### DNS Tunneling Example
+
+```go
+// DNS tunneling for censorship resistance
+config := invmux.DefaultEnhancedConfig()
+session := invmux.NewEnhancedSession(config)
+
+// Add DNS tunnel connection
+err := session.AddConnectionByAddress("dns://tunnel.example.com@8.8.8.8:53")
 if err != nil {
-    // Handle error
+    log.Fatal(err)
 }
 
-// Use the stream like a regular net.Conn
-clientStream.Write([]byte("Hello world!"))
-clientStream.Close()
+// Data will be tunneled through DNS queries
+stream, _ := session.OpenStream()
+stream.Write([]byte("This message travels through DNS!"))
 ```
 
-### Advanced Configuration
+## 🔧 Configuration
 
-InvMux provides extensive configuration options:
+### Enhanced Configuration Options
 
 ```go
-// Create a custom configuration
-config := &invmux.Config{
-    // Basic settings
-    Version:                1,
-    WindowSize:             8192,                // Size of the send window
-    MaxChunkSize:           32768,               // Maximum size of each chunk
+config := &invmux.EnhancedConfig{
+    // Base configuration
+    Config: &invmux.Config{
+        Version:                    1,
+        WindowSize:                 8192,
+        MaxChunkSize:               4096,
+        KeepAliveInterval:          10 * time.Second,
+        ConnectionWriteTimeout:     5 * time.Second,
+        EnableOutOfOrderProcessing: true,
+    },
     
-    // Buffer settings
-    ReadBufferSize:         131072,              // 128KB read buffer
-    WriteBufferSize:        131072,              // 128KB write buffer
+    // Advanced features
+    AutoHealing:              true,
+    AutoReconnect:            true,
+    ConnectionRedundancy:     2,
+    PreferReliableConnections: true,
+    UseAdaptiveDistribution:  true,
     
-    // Stream settings
-    MaxStreams:             2048,                // Maximum number of streams
-    AcceptBacklog:          1024,                // Backlog for accepting streams
+    // Pluggable components
+    ConnectionPool:     invmux.NewDefaultConnectionPool(),
+    ConnectionBalancer: invmux.NewLatencyBasedBalancer(),
+    ErrorHandler:       invmux.NewDefaultErrorHandler(),
+    HealthMonitor:      invmux.NewDefaultHealthMonitor(),
     
-    // Advanced settings
-    EnableOutOfOrderProcessing: true,            // Process out-of-order packets
-    OutOfOrderWindowSize:    2048,               // Size of out-of-order window
+    // Middleware stack
+    Middleware: []invmux.StreamMiddleware{
+        invmux.NewCompressionMiddleware(),
+        invmux.NewEncryptionMiddleware(key),
+    },
     
-    // Connection management
-    KeepAliveInterval:      15 * time.Second,    // Keep-alive interval
-    ConnectionWriteTimeout: 5 * time.Second,     // Write timeout
-    
-    // Distribution policy
-    DistributionPolicy:     invmux.RoundRobin,   // How to distribute chunks
-    // Other options: LowestLatency, HighestBandwidth, WeightedRoundRobin
+    // Health monitoring thresholds
+    HealthThresholds: invmux.HealthThresholds{
+        MaxLatency:          200 * time.Millisecond,
+        MinBandwidth:        10240, // 10KB/s minimum
+        MaxPacketLoss:       0.02,  // 2% max
+        MinHealthScore:      0.8,   // 80% minimum
+        HealthCheckInterval: 5 * time.Second,
+    },
+}
+```
+
+## 🔌 Pluggable Architecture
+
+### Connection Providers
+
+InvMux supports multiple connection types through pluggable providers:
+
+```go
+// Built-in providers
+tcpProvider := invmux.NewTCPProvider(10 * time.Second)
+udpProvider := invmux.NewUDPProvider(5 * time.Second)
+dnsProvider := invmux.NewDNSTunnelProvider("8.8.8.8:53", "tunnel.example.com", 30 * time.Second)
+
+// Register providers
+pool := invmux.NewDefaultConnectionPool()
+pool.AddProvider(tcpProvider)
+pool.AddProvider(udpProvider)
+pool.AddProvider(dnsProvider)
+```
+
+### Custom Connection Provider
+
+```go
+type CustomProvider struct {
+    name string
 }
 
-// Create a session with custom config
-session := invmux.NewSession(config)
+func (p *CustomProvider) Name() string { return p.name }
+
+func (p *CustomProvider) SupportsAddress(address string) bool {
+    return strings.HasPrefix(address, "custom://")
+}
+
+func (p *CustomProvider) Dial(ctx context.Context, address string) (invmux.PluggableConnection, error) {
+    // Implement custom connection logic
+    return customConn, nil
+}
+
+// Register your custom provider
+config.ConnectionPool.AddProvider(&CustomProvider{name: "custom"})
 ```
 
-## How It Works
+### Load Balancing Strategies
 
-InvMux takes data written to a logical stream, chunks it into smaller packets, and distributes those packets across multiple physical connections. On the receiving end, the packets are reassembled in the correct order to reconstruct the original data stream.
-
-1. When you write data to a stream, InvMux divides it into chunks
-2. Each chunk is assigned a sequential ID and sent through one of the available physical connections
-3. The receiving end collects chunks from all physical connections
-4. The chunks are reassembled in order based on their IDs
-5. The reassembled data is made available to read from the stream
-
-### Distribution Policies
-
-InvMux supports multiple distribution policies, all fully implemented:
-
-- **RoundRobin**: Distributes chunks evenly across all connections in a circular fashion
-- **LowestLatency**: Sends chunks through the connection with the lowest measured latency
-- **HighestBandwidth**: Sends chunks through the connection with the highest measured bandwidth
-- **WeightedRoundRobin**: Distributes chunks based on assigned connection weights
-
-You can set weights for specific connections:
+Choose from multiple load balancing strategies:
 
 ```go
-// Set weight for a specific connection
-session.SetConnectionWeight("connection-id", 10) // This connection gets 10x more traffic
+// Round-robin (default)
+config.ConnectionBalancer = invmux.NewRoundRobinBalancer()
+
+// Latency-based routing
+config.ConnectionBalancer = invmux.NewLatencyBasedBalancer()
+
+// Weighted distribution
+weightedBalancer := invmux.NewWeightedBalancer()
+weightedBalancer.SetWeight("tcp-connection-1", 5)  // 5x weight
+weightedBalancer.SetWeight("udp-connection-1", 2)  // 2x weight
+config.ConnectionBalancer = weightedBalancer
 ```
 
-The library automatically monitors connection performance and updates latency and bandwidth measurements for intelligent routing decisions.
+### Custom Middleware
 
-### Connection Statistics
-
-You can access detailed statistics for all connections:
+Create custom middleware for processing stream data:
 
 ```go
-// Get stats for all connections
-stats := session.GetConnectionStats()
+type LoggingMiddleware struct{}
 
-// Get connections sorted by latency (lowest first)
-sortedByLatency := session.SortConnectionsByLatency()
+func (m *LoggingMiddleware) Name() string { return "logger" }
 
-// Get connections sorted by bandwidth (highest first)
-sortedByBandwidth := session.SortConnectionsByBandwidth()
+func (m *LoggingMiddleware) ProcessWrite(streamID uint32, data []byte) ([]byte, error) {
+    log.Printf("Stream %d writing %d bytes", streamID, len(data))
+    return data, nil
+}
+
+func (m *LoggingMiddleware) ProcessRead(streamID uint32, data []byte) ([]byte, error) {
+    log.Printf("Stream %d reading %d bytes", streamID, len(data))
+    return data, nil
+}
+
+func (m *LoggingMiddleware) OnStreamOpen(streamID uint32) error {
+    log.Printf("Stream %d opened", streamID)
+    return nil
+}
+
+func (m *LoggingMiddleware) OnStreamClose(streamID uint32) error {
+    log.Printf("Stream %d closed", streamID)
+    return nil
+}
+
+// Add to configuration
+config.Middleware = append(config.Middleware, &LoggingMiddleware{})
 ```
 
-## Performance Benefits
+## 📊 Monitoring and Metrics
 
-Using multiple physical connections can provide several benefits:
+### Session Metrics
 
-- **Increased throughput**: Combine the bandwidth of multiple connections
-- **Redundancy**: If one connection fails, the others can continue
-- **Bypass connection limits**: Useful when providers limit bandwidth per connection
-- **Reduced latency**: Different connections may take different routes with varying latency
-- **Load balancing**: Distribute traffic across multiple paths
+```go
+metrics := session.GetMetrics()
+fmt.Printf("Connections: %d active, %d total\n", 
+    metrics.ConnectionsActive, metrics.ConnectionsTotal)
+fmt.Printf("Streams: %d active, %d total\n", 
+    metrics.StreamsActive, metrics.StreamsTotal)
+fmt.Printf("Data: %d bytes sent, %d bytes received\n", 
+    metrics.BytesSent, metrics.BytesReceived)
+fmt.Printf("Performance: avg latency %v, avg bandwidth %d bytes/s\n", 
+    metrics.AverageLatency, metrics.AverageBandwidth)
+```
 
-## License
+### Stream Metrics
 
-This library is released under the MIT License. 
+```go
+streamMetrics := stream.GetMetrics()
+fmt.Printf("Stream %d: %d bytes read, %d bytes written, priority %d, QoS %s\n",
+    streamMetrics.StreamID, streamMetrics.BytesRead, streamMetrics.BytesWritten,
+    streamMetrics.Priority, streamMetrics.QoSClass)
+```
+
+### Connection Health
+
+```go
+connections := session.GetConnections()
+for _, conn := range connections {
+    metadata := conn.Metadata()
+    quality := conn.Quality()
+    fmt.Printf("Connection: type=%s, healthy=%t, latency=%v, score=%.2f\n",
+        metadata.Type, quality.IsHealthy, quality.Latency, quality.HealthScore)
+}
+```
+
+## 🌐 Real-World Use Cases
+
+### 1. Bandwidth Aggregation
+Combine multiple internet connections (DSL + Cable + 4G) for increased throughput:
+
+```go
+session.AddConnectionByAddress("tcp://isp1.example.com:8080")
+session.AddConnectionByAddress("tcp://isp2.example.com:8080") 
+session.AddConnectionByAddress("tcp://mobile.example.com:8080")
+```
+
+### 2. Censorship Resistance
+Use DNS tunneling to bypass firewalls and deep packet inspection:
+
+```go
+// Primary connection
+session.AddConnectionByAddress("tcp://server.example.com:443")
+
+// Backup DNS tunnel for censorship circumvention
+session.AddConnectionByAddress("dns://tunnel.example.com@8.8.8.8")
+```
+
+### 3. High Availability
+Automatic failover between multiple paths:
+
+```go
+config.AutoHealing = true
+config.ConnectionRedundancy = 3
+
+session.AddConnectionByAddress("tcp://primary.example.com:8080")
+session.AddConnectionByAddress("tcp://backup1.example.com:8080")
+session.AddConnectionByAddress("tcp://backup2.example.com:8080")
+```
+
+### 4. Latency Optimization
+Route traffic through the lowest latency path:
+
+```go
+config.ConnectionBalancer = invmux.NewLatencyBasedBalancer()
+
+session.AddConnectionByAddress("tcp://us-east.example.com:8080")
+session.AddConnectionByAddress("tcp://us-west.example.com:8080")
+session.AddConnectionByAddress("tcp://eu.example.com:8080")
+```
+
+## 🔒 Security Features
+
+### Encryption Middleware
+Built-in encryption support with pluggable algorithms:
+
+```go
+// AES encryption (implement with crypto/aes)
+aesKey := make([]byte, 32) // 256-bit key
+config.Middleware = append(config.Middleware, 
+    invmux.NewEncryptionMiddleware(aesKey))
+```
+
+### DNS Tunneling Security
+DNS tunneling includes several security considerations:
+- Encoded payloads to avoid detection
+- Configurable query patterns
+- Support for various DNS record types
+- Built-in anti-fingerprinting measures
+
+## ⚡ Performance Optimizations
+
+### Buffer Management
+Fine-tune buffer sizes for your use case:
+
+```go
+config.ReadBufferSize = 128 * 1024   // 128KB read buffer
+config.WriteBufferSize = 128 * 1024  // 128KB write buffer
+config.MaxChunkSize = 32 * 1024      // 32KB chunks
+```
+
+### Connection Pooling
+Reuse connections efficiently:
+
+```go
+config.ConnectionPool.SetAutoHealing(true)
+```
+
+### Out-of-Order Processing
+Handle packet reordering efficiently:
+
+```go
+config.EnableOutOfOrderProcessing = true
+config.OutOfOrderWindowSize = 1024
+```
+
+## 🐛 Error Handling
+
+### Custom Error Handler
+
+```go
+type CustomErrorHandler struct{}
+
+func (h *CustomErrorHandler) HandleConnectionError(conn invmux.PluggableConnection, err error) invmux.ErrorAction {
+    if strings.Contains(err.Error(), "timeout") {
+        return invmux.ErrorActionRetry
+    }
+    if strings.Contains(err.Error(), "connection refused") {
+        return invmux.ErrorActionReconnect
+    }
+    return invmux.ErrorActionRemoveConnection
+}
+
+func (h *CustomErrorHandler) HandleSessionError(session *invmux.EnhancedSession, err error) invmux.ErrorAction {
+    log.Printf("Session error: %v", err)
+    return invmux.ErrorActionIgnore
+}
+
+func (h *CustomErrorHandler) HandleStreamError(stream *invmux.EnhancedStream, err error) invmux.ErrorAction {
+    log.Printf("Stream %d error: %v", stream.StreamID(), err)
+    return invmux.ErrorActionIgnore
+}
+
+config.ErrorHandler = &CustomErrorHandler{}
+```
+
+## 🧪 Testing
+
+Run the examples:
+
+```bash
+# Basic example
+go run examples/advanced/advanced_example.go
+
+# Enhanced features example
+go run examples/advanced/enhanced_example.go
+```
+
+Run tests:
+
+```bash
+go test -v ./...
+```
+
+## 📚 Advanced Topics
+
+### Connection Provider Architecture
+The pluggable connection provider system allows supporting any transport:
+- Traditional network protocols (TCP, UDP, SCTP)
+- Tunneling protocols (DNS, HTTP, WebSocket)
+- Custom protocols (radio, satellite, mesh networks)
+- Virtual connections (in-memory, file-based)
+
+### Middleware Pipeline
+Middleware processes data in a pipeline:
+1. **Write Path**: Original Data → Middleware 1 → Middleware 2 → Network
+2. **Read Path**: Network → Middleware 2 → Middleware 1 → Original Data
+
+Common middleware types:
+- **Compression**: Reduce bandwidth usage
+- **Encryption**: Secure data transmission  
+- **Protocol Translation**: Convert between protocols
+- **Rate Limiting**: Control traffic flow
+- **Logging/Analytics**: Monitor usage patterns
+
+### Health Monitoring
+The health monitoring system continuously evaluates:
+- **Latency**: Round-trip time measurements
+- **Bandwidth**: Throughput capacity
+- **Packet Loss**: Reliability metrics
+- **Error Rate**: Connection stability
+- **Activity**: Last successful communication
+
+Unhealthy connections are automatically:
+- Removed from load balancing rotation
+- Scheduled for reconnection attempts
+- Replaced with backup connections
+
+## 🤝 Contributing
+
+We welcome contributions! Please see our contributing guidelines for details.
+
+## 📄 License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## 🔗 Related Projects
+
+- [smux](https://github.com/xtaci/smux) - Stream multiplexing library for Go
+- [yamux](https://github.com/hashicorp/yamux) - Golang connection multiplexing library
+- [dnstt](https://www.bamsoftware.com/software/dnstt/) - DNS tunneling tool
+
+## 📞 Support
+
+- Create an issue for bug reports or feature requests
+- Join our discussions for questions and community support
+- Check the examples directory for usage patterns
+
+---
+
+**InvMux** - Bringing the power of inverse multiplexing to Go applications with unprecedented flexibility and performance. 
